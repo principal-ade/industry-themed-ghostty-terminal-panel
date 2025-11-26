@@ -1,4 +1,5 @@
 import { GhosttyTerminal } from './panels/GhosttyTerminal';
+import { TabbedGhosttyTerminal } from './panels/TabbedGhosttyTerminal';
 import type { PanelDefinition, PanelContextValue } from './types';
 
 /**
@@ -39,6 +40,32 @@ export const panels: PanelDefinition[] = [
       // The host should be notified to clean up the PTY process
     },
   },
+  {
+    metadata: {
+      id: 'com.ghostty.tabbed-terminal-panel',
+      name: 'Tabbed Ghostty Terminal',
+      icon: '📑',
+      version: '0.1.0',
+      author: 'Ghostty Integration',
+      description:
+        'Multi-tab terminal panel with keyboard shortcuts (⌘T, ⌘W, ⌘1-9) using Ghostty rendering engine',
+      slices: ['terminal'],
+    },
+    component: TabbedGhosttyTerminal,
+
+    onMount: async (context: PanelContextValue) => {
+      // eslint-disable-next-line no-console
+      console.log(
+        'Tabbed Ghostty Terminal mounted',
+        context.currentScope.repository?.path
+      );
+    },
+
+    onUnmount: async (_context: PanelContextValue) => {
+      // eslint-disable-next-line no-console
+      console.log('Tabbed Ghostty Terminal unmounting');
+    },
+  },
 ];
 
 /**
@@ -58,3 +85,20 @@ export const onPackageUnload = async () => {
   // eslint-disable-next-line no-console
   console.log('Ghostty Terminal Panel package unloading');
 };
+
+// Re-export components for direct use
+export { GhosttyTerminal } from './panels/GhosttyTerminal';
+export { TabbedGhosttyTerminal } from './panels/TabbedGhosttyTerminal';
+export type { TerminalTab, TabbedGhosttyTerminalProps } from './panels/TabbedGhosttyTerminal';
+
+// Re-export types
+export type {
+  PanelDefinition,
+  PanelContextValue,
+  PanelComponentProps,
+  PanelActions,
+  PanelEventEmitter,
+  PanelEvent,
+  TerminalTab as TerminalTabType,
+  TabbedGhosttyTerminalProps as TabbedTerminalProps,
+} from './types';
