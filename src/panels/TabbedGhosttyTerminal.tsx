@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal, FitAddon } from 'ghostty-web';
 import { Plus, X } from 'lucide-react';
-import type { PanelComponentProps, PanelEvent } from '../types';
+import type { PanelComponentProps, PanelEvent, TerminalActions, PortReadyData } from '../types';
 
 // Terminal session info returned from list
 interface TerminalSessionInfo {
@@ -10,31 +10,9 @@ interface TerminalSessionInfo {
   context?: string;
 }
 
-// Extended actions interface for terminal-specific actions
-interface TerminalActions {
-  createTerminalSession?: (options?: { cwd?: string; context?: string }) => Promise<string>;
-  writeToTerminal?: (sessionId: string, data: string) => Promise<void>;
-  resizeTerminal?: (sessionId: string, cols: number, rows: number) => Promise<void>;
-  destroyTerminalSession?: (sessionId: string) => Promise<void>;
-  checkTerminalOwnership?: (sessionId: string) => Promise<OwnershipStatus>;
-  claimTerminalOwnership?: (sessionId: string, force?: boolean) => Promise<OwnershipResult>;
-  releaseTerminalOwnership?: (sessionId: string) => Promise<OwnershipResult>;
-  refreshTerminal?: (sessionId: string) => Promise<boolean>;
+// Extend TerminalActions with listTerminalSessions for restoration
+interface ExtendedTerminalActions extends TerminalActions {
   listTerminalSessions?: () => Promise<TerminalSessionInfo[]>;
-}
-
-interface OwnershipStatus {
-  exists: boolean;
-  ownedByWindowId: number | null;
-  ownedByThisWindow?: boolean;
-  canClaim: boolean;
-  ownerWindowExists?: boolean;
-}
-
-interface OwnershipResult {
-  success: boolean;
-  reason?: string;
-  ownedByWindowId?: number;
 }
 
 /**
@@ -64,12 +42,13 @@ export interface TabbedGhosttyTerminalProps extends PanelComponentProps {
 /**
  * Individual Terminal Tab Content
  * Renders a single Ghostty terminal instance for a tab
+ * Uses MessagePort for high-performance data streaming when available
  */
 const TerminalTabContent = React.memo<{
   tabId: string;
   isActive: boolean;
   sessionId: string | null;
-  terminalActions: TerminalActions;
+  terminalActions: ExtendedTerminalActions;
   events: PanelComponentProps['events'];
   onSessionCreated: (tabId: string, sessionId: string) => void;
   directory?: string;
@@ -87,16 +66,59 @@ const TerminalTabContent = React.memo<{
   const fitAddonRef = useRef<FitAddon | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const hasInitializedRef = useRef(false);
+  const dataPortRef = useRef<MessagePort | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [isInitializing, setIsInitializing] = useState(!sessionId);
+  const [usingMessagePort, setUsingMessagePort] = useState(false);
+
+  // Set up MessagePort ready listener
+  useEffect(() => {
+    if (!sessionId || !terminalActions.onTerminalPortReady) return;
+
+    const handlePortReady = (data: PortReadyData, port: MessagePort) => {
+      if (data.sessionId === sessionId) {
+        console.log(`[TabbedGhosttyTerminal] Received MessagePort for tab ${tabId}, session ${sessionId}`);
+        dataPortRef.current = port;
+        port.start();
+        setUsingMessagePort(true);
+      }
+    };
+
+    const unsubscribe = terminalActions.onTerminalPortReady(handlePortReady);
+
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
+  }, [sessionId, tabId, terminalActions]);
 
   // Create terminal session on mount if not already created
   useEffect(() => {
-    if (sessionId || hasInitializedRef.current) {
-      setIsInitializing(false);
+    if (hasInitializedRef.current) {
       return;
     }
+
+    // If we already have a sessionId (restored session), just claim ownership
+    if (sessionId) {
+      hasInitializedRef.current = true;
+      const claimRestored = async () => {
+        try {
+          // Claim ownership of the restored session
+          if (terminalActions.claimTerminalOwnership) {
+            await terminalActions.claimTerminalOwnership(sessionId, true); // force claim
+          }
+          setIsInitializing(false);
+        } catch (err) {
+          console.warn('[TabbedGhosttyTerminal] Failed to claim restored session:', err);
+          setIsInitializing(false);
+        }
+      };
+      claimRestored();
+      return;
+    }
+
     hasInitializedRef.current = true;
 
     const initSession = async () => {
@@ -126,6 +148,28 @@ const TerminalTabContent = React.memo<{
 
     initSession();
   }, [tabId, directory, sessionId, terminalActions, onSessionCreated]);
+
+  // Request MessagePort after session is created
+  useEffect(() => {
+    if (!sessionId || !terminalActions.requestTerminalDataPort) {
+      return;
+    }
+
+    const requestPort = async () => {
+      try {
+        console.log(`[TabbedGhosttyTerminal] Requesting MessagePort for tab ${tabId}, session ${sessionId}`);
+        const result = await terminalActions.requestTerminalDataPort!(sessionId);
+        if (!result.success) {
+          console.warn(`[TabbedGhosttyTerminal] Failed to request MessagePort: ${result.reason}`);
+        }
+        // Port will arrive via onTerminalPortReady callback
+      } catch (error) {
+        console.error('[TabbedGhosttyTerminal] Error requesting MessagePort:', error);
+      }
+    };
+
+    requestPort();
+  }, [sessionId, tabId, terminalActions]);
 
   // Initialize Ghostty terminal UI when we have a session and are active
   useEffect(() => {
@@ -176,7 +220,7 @@ const TerminalTabContent = React.memo<{
         });
         resizeObserverRef.current.observe(terminalRef.current!);
 
-        // Refresh to get existing buffer
+        // Refresh to get existing buffer after terminal is ready
         if (terminalActions.refreshTerminal) {
           setTimeout(async () => {
             try {
@@ -184,7 +228,7 @@ const TerminalTabContent = React.memo<{
             } catch (e) {
               console.warn('[TabbedGhosttyTerminal] Failed to refresh:', e);
             }
-          }, 300);
+          }, 200);
         }
       } catch (err) {
         console.error('[TabbedGhosttyTerminal] Failed to initialize:', err);
@@ -207,8 +251,30 @@ const TerminalTabContent = React.memo<{
     };
   }, [sessionId, isActive, terminalActions]);
 
-  // Subscribe to terminal data events
+  // HIGH-PERFORMANCE PATH: Incoming data via MessagePort
   useEffect(() => {
+    if (!usingMessagePort || !dataPortRef.current) return;
+
+    const port = dataPortRef.current;
+
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'DATA' && terminalInstanceRef.current) {
+        terminalInstanceRef.current.write(event.data.data);
+      }
+    };
+
+    port.addEventListener('message', handleMessage);
+    console.log(`[TabbedGhosttyTerminal] Tab ${tabId} listening on MessagePort for terminal data`);
+
+    return () => {
+      port.removeEventListener('message', handleMessage);
+    };
+  }, [usingMessagePort, tabId]);
+
+  // FALLBACK PATH: Incoming data via panel events (only if MessagePort not available)
+  useEffect(() => {
+    // Skip if using MessagePort
+    if (usingMessagePort) return;
     if (!sessionId) return;
 
     const handleData = (event: PanelEvent<{ sessionId?: string; data?: string }>) => {
@@ -227,6 +293,7 @@ const TerminalTabContent = React.memo<{
       }
     };
 
+    console.log(`[TabbedGhosttyTerminal] Tab ${tabId} using event fallback for terminal data`);
     const unsubscribeData = events.on('terminal:data', handleData);
     const unsubscribeExit = events.on('terminal:exit', handleExit);
 
@@ -236,7 +303,7 @@ const TerminalTabContent = React.memo<{
       if (typeof unsubscribeExit === 'function') unsubscribeExit();
       else events.off('terminal:exit', handleExit);
     };
-  }, [events, sessionId]);
+  }, [events, sessionId, usingMessagePort, tabId]);
 
   // Focus terminal and refresh when tab becomes active
   useEffect(() => {
@@ -258,6 +325,16 @@ const TerminalTabContent = React.memo<{
       }
     }
   }, [isActive, sessionId, terminalActions]);
+
+  // Cleanup MessagePort on unmount
+  useEffect(() => {
+    return () => {
+      if (dataPortRef.current) {
+        dataPortRef.current.close();
+        dataPortRef.current = null;
+      }
+    };
+  }, []);
 
   if (error) {
     return (
@@ -317,6 +394,8 @@ TerminalTabContent.displayName = 'TerminalTabContent';
  * TabbedGhosttyTerminal Panel
  *
  * A multi-tab terminal panel using the Ghostty WebAssembly engine.
+ * Uses MessagePort for high-performance data streaming when available.
+ *
  * Supports keyboard shortcuts for tab management:
  * - Cmd/Ctrl + T: New tab
  * - Cmd/Ctrl + W: Close current tab
@@ -335,7 +414,7 @@ export const TabbedGhosttyTerminal: React.FC<TabbedGhosttyTerminalProps> = ({
     (context as { repositoryPath?: string })?.repositoryPath ||
     context?.currentScope?.repository?.path;
 
-  const terminalActions = actions as typeof actions & TerminalActions;
+  const terminalActions = actions as typeof actions & ExtendedTerminalActions;
 
   // Tab state - start empty, will be populated by restoration or initial tab creation
   const [tabs, setTabs] = useState<TerminalTab[]>([]);

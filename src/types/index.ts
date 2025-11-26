@@ -36,6 +36,80 @@ export type {
 } from '@principal-ade/panel-framework-core';
 
 /**
+ * Terminal ownership status returned by checkTerminalOwnership
+ */
+export interface OwnershipStatus {
+  exists: boolean;
+  ownedByWindowId: number | null;
+  ownedByThisWindow?: boolean;
+  canClaim: boolean;
+  ownerWindowExists?: boolean;
+}
+
+/**
+ * Result of ownership operations (claim/release)
+ */
+export interface OwnershipResult {
+  success: boolean;
+  reason?: string;
+  ownedByWindowId?: number;
+}
+
+/**
+ * Result of requesting a MessagePort for terminal data
+ */
+export interface RequestDataPortResult {
+  success: boolean;
+  reason?: string;
+}
+
+/**
+ * Data provided when a MessagePort is ready
+ */
+export interface PortReadyData {
+  sessionId: string;
+  writable: boolean;
+  ownershipToken?: string;
+}
+
+/**
+ * Extended terminal actions interface for terminal-specific panel actions.
+ * These actions are provided by the host application's PanelContext.
+ */
+export interface TerminalActions {
+  // Session management
+  createTerminalSession?: (options?: { cwd?: string; context?: string }) => Promise<string>;
+  writeToTerminal?: (sessionId: string, data: string) => Promise<void>;
+  resizeTerminal?: (sessionId: string, cols: number, rows: number) => Promise<void>;
+  destroyTerminalSession?: (sessionId: string) => Promise<void>;
+
+  // MessagePort-based data streaming (high-performance path)
+  /**
+   * Request a MessagePort for receiving terminal data directly.
+   * This bypasses IPC for high-performance data streaming.
+   * The port will be delivered via onTerminalPortReady callback.
+   */
+  requestTerminalDataPort?: (sessionId: string) => Promise<RequestDataPortResult>;
+
+  /**
+   * Register a callback to receive MessagePorts for terminal data streaming.
+   * Call this before requestTerminalDataPort() to ensure you receive the port.
+   * Returns an unsubscribe function.
+   */
+  onTerminalPortReady?: (
+    callback: (data: PortReadyData, port: MessagePort) => void
+  ) => () => void;
+
+  // Ownership management
+  checkTerminalOwnership?: (sessionId: string) => Promise<OwnershipStatus>;
+  claimTerminalOwnership?: (sessionId: string, force?: boolean) => Promise<OwnershipResult>;
+  releaseTerminalOwnership?: (sessionId: string) => Promise<OwnershipResult>;
+
+  // Terminal control
+  refreshTerminal?: (sessionId: string) => Promise<boolean>;
+}
+
+/**
  * Terminal tab representation for tabbed terminal panel.
  */
 export interface TerminalTab {

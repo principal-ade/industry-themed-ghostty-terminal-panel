@@ -1,33 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal, FitAddon } from 'ghostty-web';
-import type { PanelComponentProps, PanelEvent } from '../types';
-
-// Extended actions interface for terminal-specific actions (matching industry-themed-terminal)
-interface TerminalActions {
-  createTerminalSession?: (options?: { cwd?: string }) => Promise<string>;
-  writeToTerminal?: (sessionId: string, data: string) => Promise<void>;
-  resizeTerminal?: (sessionId: string, cols: number, rows: number) => Promise<void>;
-  destroyTerminalSession?: (sessionId: string) => Promise<void>;
-  // Ownership actions
-  checkTerminalOwnership?: (sessionId: string) => Promise<OwnershipStatus>;
-  claimTerminalOwnership?: (sessionId: string, force?: boolean) => Promise<OwnershipResult>;
-  releaseTerminalOwnership?: (sessionId: string) => Promise<OwnershipResult>;
-  refreshTerminal?: (sessionId: string) => Promise<boolean>;
-}
-
-interface OwnershipStatus {
-  exists: boolean;
-  ownedByWindowId: number | null;
-  ownedByThisWindow?: boolean;
-  canClaim: boolean;
-  ownerWindowExists?: boolean;
-}
-
-interface OwnershipResult {
-  success: boolean;
-  reason?: string;
-  ownedByWindowId?: number;
-}
+import type { PanelComponentProps, PanelEvent, TerminalActions, PortReadyData } from '../types';
 
 /**
  * GhosttyTerminal Panel
@@ -38,13 +11,14 @@ interface OwnershipResult {
  *
  * Architecture:
  * - View Layer: ghostty-web (Wasm) handles rendering and input capture
- * - Transport Layer: Panel actions/events communicate via Electron IPC
+ * - Transport Layer: MessagePort for high-performance data streaming (with event fallback)
  * - Logic Layer: node-pty in Electron main process runs the actual shell
  *
  * Lifecycle:
  * - On mount: Creates a terminal session via actions.createTerminalSession()
  * - Checks ownership and claims if available, shows overlay if owned elsewhere
- * - During use: Receives terminal output via events.on('terminal:data')
+ * - Requests MessagePort for direct data streaming (bypasses IPC overhead)
+ * - Falls back to events.on('terminal:data') if MessagePort unavailable
  * - On ownership lost: Shows overlay with option to take control
  * - On unmount: Does NOT destroy session (maintains ownership for tab switching)
  */
@@ -58,9 +32,11 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
   const fitAddonRef = useRef<FitAddon | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const hasInitializedRef = useRef(false);
+  const dataPortRef = useRef<MessagePort | null>(null);
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [usingMessagePort, setUsingMessagePort] = useState(false);
 
   // Ownership state
   const [ownershipStatus, setOwnershipStatus] = useState<{
@@ -105,6 +81,28 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
       console.error('[GhosttyTerminal] Failed to take control:', error);
       setIsTransitioning(false);
     }
+  }, [sessionId, terminalActions]);
+
+  // Set up MessagePort ready listener BEFORE requesting port
+  useEffect(() => {
+    if (!terminalActions.onTerminalPortReady) return;
+
+    const handlePortReady = (data: PortReadyData, port: MessagePort) => {
+      if (data.sessionId === sessionId) {
+        console.log(`[GhosttyTerminal] Received MessagePort for session ${sessionId}`);
+        dataPortRef.current = port;
+        port.start();
+        setUsingMessagePort(true);
+      }
+    };
+
+    const unsubscribe = terminalActions.onTerminalPortReady(handlePortReady);
+
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
   }, [sessionId, terminalActions]);
 
   // Initialize terminal session on mount (only once)
@@ -179,6 +177,30 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
     };
   }, [terminalDirectory]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Request MessagePort for data streaming after session is created and we have ownership
+  useEffect(() => {
+    if (!sessionId || !shouldRenderTerminal) return;
+    if (!terminalActions.requestTerminalDataPort) {
+      console.log('[GhosttyTerminal] MessagePort not available, will use event fallback');
+      return;
+    }
+
+    const requestPort = async () => {
+      try {
+        console.log(`[GhosttyTerminal] Requesting MessagePort for session ${sessionId}`);
+        const result = await terminalActions.requestTerminalDataPort!(sessionId);
+        if (!result.success) {
+          console.warn(`[GhosttyTerminal] Failed to request MessagePort: ${result.reason}`);
+        }
+        // Port will arrive via onTerminalPortReady callback
+      } catch (error) {
+        console.error('[GhosttyTerminal] Error requesting MessagePort:', error);
+      }
+    };
+
+    requestPort();
+  }, [sessionId, shouldRenderTerminal, terminalActions]);
+
   // Listen for ownership lost events
   useEffect(() => {
     if (!sessionId) return;
@@ -194,6 +216,13 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
           canTakeControl: true,
         });
         setShouldRenderTerminal(false);
+
+        // Clean up MessagePort when ownership is lost
+        if (dataPortRef.current) {
+          dataPortRef.current.close();
+          dataPortRef.current = null;
+          setUsingMessagePort(false);
+        }
       }
     };
 
@@ -301,8 +330,30 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
     };
   }, [sessionId, shouldRenderTerminal, terminalActions]);
 
-  // Incoming: Host sends PTY data -> Write to terminal (only when we own it)
+  // HIGH-PERFORMANCE PATH: Incoming data via MessagePort
   useEffect(() => {
+    if (!usingMessagePort || !dataPortRef.current) return;
+
+    const port = dataPortRef.current;
+
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'DATA' && terminalInstanceRef.current) {
+        terminalInstanceRef.current.write(event.data.data);
+      }
+    };
+
+    port.addEventListener('message', handleMessage);
+    console.log('[GhosttyTerminal] Listening on MessagePort for terminal data');
+
+    return () => {
+      port.removeEventListener('message', handleMessage);
+    };
+  }, [usingMessagePort]);
+
+  // FALLBACK PATH: Incoming data via panel events (only if MessagePort not available)
+  useEffect(() => {
+    // Skip if using MessagePort
+    if (usingMessagePort) return;
     if (!sessionId || !shouldRenderTerminal) return;
 
     const handleData = (event: PanelEvent<{ sessionId?: string; data?: string }>) => {
@@ -322,6 +373,7 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
       }
     };
 
+    console.log('[GhosttyTerminal] Using event fallback for terminal data (MessagePort not available)');
     const unsubscribeData = events.on('terminal:data', handleData);
     const unsubscribeExit = events.on('terminal:exit', handleExit);
 
@@ -337,7 +389,7 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
         events.off('terminal:exit', handleExit);
       }
     };
-  }, [events, sessionId, shouldRenderTerminal]);
+  }, [events, sessionId, shouldRenderTerminal, usingMessagePort]);
 
   // Handle terminal clear command
   useEffect(() => {
@@ -353,6 +405,16 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
       events.off('terminal:clear', handleClear);
     };
   }, [events]);
+
+  // Cleanup MessagePort on unmount
+  useEffect(() => {
+    return () => {
+      if (dataPortRef.current) {
+        dataPortRef.current.close();
+        dataPortRef.current = null;
+      }
+    };
+  }, []);
 
   // Determine if we should show the overlay
   const showOverlay = !shouldRenderTerminal || isTransitioning;
