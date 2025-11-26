@@ -1,0 +1,33 @@
+# Source files (we only publish dist/)
+src/
+*.tsx
+*.ts
+!*.d.ts
+
+# Config files
+tsconfig.json
+tsconfig.build.json
+vite.config.ts
+eslint.config.js
+.prettierrc
+.prettierignore
+
+# Development files
+.git/
+.github/
+.vscode/
+.idea/
+*.test.ts
+*.test.tsx
+*.spec.ts
+*.spec.tsx
+
+# Documentation (keep README and LICENSE)
+# Add any docs you don't want published
+
+# Other
+node_modules/
+coverage/
+.env*
+*.log
+.DS_Store
