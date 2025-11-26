@@ -5,7 +5,7 @@ import type { PanelComponentProps, PanelEvent } from '../types';
 
 // Extended actions interface for terminal-specific actions
 interface TerminalActions {
-  createTerminalSession?: (options?: { cwd?: string }) => Promise<string>;
+  createTerminalSession?: (options?: { cwd?: string; context?: string }) => Promise<string>;
   writeToTerminal?: (sessionId: string, data: string) => Promise<void>;
   resizeTerminal?: (sessionId: string, cols: number, rows: number) => Promise<void>;
   destroyTerminalSession?: (sessionId: string) => Promise<void>;
@@ -91,8 +91,10 @@ const TerminalTabContent = React.memo<{
           throw new Error('Terminal actions not available');
         }
 
+        // Pass tabId as context to ensure unique session per tab
         const id = await terminalActions.createTerminalSession({
           cwd: directory || undefined,
+          context: tabId,
         });
 
         // Claim ownership
