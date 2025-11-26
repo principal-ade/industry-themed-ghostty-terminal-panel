@@ -350,46 +350,20 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
     };
   }, [usingMessagePort]);
 
-  // FALLBACK PATH: Incoming data via panel events (only if MessagePort not available)
+  // Fail fast if MessagePort is not available after timeout
   useEffect(() => {
-    // Skip if using MessagePort
-    if (usingMessagePort) return;
+    if (usingMessagePort) return; // Already have port, no need to check
     if (!sessionId || !shouldRenderTerminal) return;
 
-    const handleData = (event: PanelEvent<{ sessionId?: string; data?: string }>) => {
-      if (
-        terminalInstanceRef.current &&
-        event.payload?.sessionId === sessionId &&
-        event.payload?.data
-      ) {
-        terminalInstanceRef.current.write(event.payload.data);
+    const timeout = setTimeout(() => {
+      if (!dataPortRef.current) {
+        console.error('[GhosttyTerminal] MessagePort not received after timeout - terminal data will not be displayed');
+        setError('MessagePort not available. Terminal data streaming requires MessagePort support from the host.');
       }
-    };
+    }, 3000); // 3 second timeout
 
-    // Handle terminal exit events
-    const handleExit = (event: PanelEvent<{ sessionId?: string; exitCode?: number }>) => {
-      if (event.payload?.sessionId === sessionId) {
-        setError(`Terminal process exited with code ${event.payload.exitCode}`);
-      }
-    };
-
-    console.log('[GhosttyTerminal] Using event fallback for terminal data (MessagePort not available)');
-    const unsubscribeData = events.on('terminal:data', handleData);
-    const unsubscribeExit = events.on('terminal:exit', handleExit);
-
-    return () => {
-      if (typeof unsubscribeData === 'function') {
-        unsubscribeData();
-      } else {
-        events.off('terminal:data', handleData);
-      }
-      if (typeof unsubscribeExit === 'function') {
-        unsubscribeExit();
-      } else {
-        events.off('terminal:exit', handleExit);
-      }
-    };
-  }, [events, sessionId, shouldRenderTerminal, usingMessagePort]);
+    return () => clearTimeout(timeout);
+  }, [sessionId, shouldRenderTerminal, usingMessagePort]);
 
   // Handle terminal clear command
   useEffect(() => {
