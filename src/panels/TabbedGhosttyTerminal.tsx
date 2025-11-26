@@ -3,6 +3,13 @@ import { Terminal, FitAddon } from 'ghostty-web';
 import { Plus, X } from 'lucide-react';
 import type { PanelComponentProps, PanelEvent } from '../types';
 
+// Terminal session info returned from list
+interface TerminalSessionInfo {
+  id: string;
+  directory: string;
+  context?: string;
+}
+
 // Extended actions interface for terminal-specific actions
 interface TerminalActions {
   createTerminalSession?: (options?: { cwd?: string; context?: string }) => Promise<string>;
@@ -13,6 +20,7 @@ interface TerminalActions {
   claimTerminalOwnership?: (sessionId: string, force?: boolean) => Promise<OwnershipResult>;
   releaseTerminalOwnership?: (sessionId: string) => Promise<OwnershipResult>;
   refreshTerminal?: (sessionId: string) => Promise<boolean>;
+  listTerminalSessions?: () => Promise<TerminalSessionInfo[]>;
 }
 
 interface OwnershipStatus {
@@ -45,6 +53,12 @@ export interface TerminalTab {
 export interface TabbedGhosttyTerminalProps extends PanelComponentProps {
   initialTabs?: TerminalTab[];
   onTabsChange?: (tabs: TerminalTab[]) => void;
+  /**
+   * Context prefix used to filter and restore existing terminal sessions.
+   * Sessions with context starting with this prefix will be restored as tabs.
+   * New tabs will use this prefix + tab ID as their context.
+   */
+  contextPrefix?: string;
 }
 
 /**
@@ -224,16 +238,26 @@ const TerminalTabContent = React.memo<{
     };
   }, [events, sessionId]);
 
-  // Focus terminal when tab becomes active
+  // Focus terminal and refresh when tab becomes active
   useEffect(() => {
-    if (isActive && terminalInstanceRef.current) {
+    if (isActive && terminalInstanceRef.current && sessionId) {
       terminalInstanceRef.current.focus();
       // Refit on activation
       if (fitAddonRef.current) {
         fitAddonRef.current.fit();
       }
+      // Refresh to get buffer contents when switching to this tab
+      if (terminalActions.refreshTerminal) {
+        setTimeout(async () => {
+          try {
+            await terminalActions.refreshTerminal!(sessionId);
+          } catch (e) {
+            console.warn('[TabbedGhosttyTerminal] Failed to refresh on tab switch:', e);
+          }
+        }, 100);
+      }
     }
-  }, [isActive]);
+  }, [isActive, sessionId, terminalActions]);
 
   if (error) {
     return (
@@ -304,28 +328,19 @@ export const TabbedGhosttyTerminal: React.FC<TabbedGhosttyTerminalProps> = ({
   context,
   initialTabs,
   onTabsChange,
+  contextPrefix,
 }) => {
   // Get terminal directory from context
   const terminalDirectory =
     (context as { repositoryPath?: string })?.repositoryPath ||
     context?.currentScope?.repository?.path;
 
-  // Tab state
-  const [tabs, setTabs] = useState<TerminalTab[]>(() => {
-    if (initialTabs && initialTabs.length > 0) {
-      return initialTabs;
-    }
-    return [{
-      id: `tab-${Date.now()}`,
-      label: terminalDirectory?.split('/').pop() || 'Terminal',
-      directory: terminalDirectory || undefined,
-      isActive: true,
-    }];
-  });
+  const terminalActions = actions as typeof actions & TerminalActions;
 
-  const [activeTabId, setActiveTabId] = useState<string>(
-    tabs.find(t => t.isActive)?.id || tabs[0]?.id
-  );
+  // Tab state - start empty, will be populated by restoration or initial tab creation
+  const [tabs, setTabs] = useState<TerminalTab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string>('');
+  const [isRestoring, setIsRestoring] = useState(true);
 
   // Session tracking: Map<tabId, sessionId>
   const [sessionIds, setSessionIds] = useState<Map<string, string>>(new Map());
@@ -334,8 +349,7 @@ export const TabbedGhosttyTerminal: React.FC<TabbedGhosttyTerminalProps> = ({
   const tabsRef = useRef(tabs);
   const activeTabIdRef = useRef(activeTabId);
   const isCreatingTabRef = useRef(false);
-
-  const terminalActions = actions as typeof actions & TerminalActions;
+  const hasRestoredRef = useRef(false);
 
   // Keep refs in sync
   useEffect(() => {
@@ -343,10 +357,81 @@ export const TabbedGhosttyTerminal: React.FC<TabbedGhosttyTerminalProps> = ({
     activeTabIdRef.current = activeTabId;
   }, [tabs, activeTabId]);
 
+  // Restore existing sessions or create initial tab
+  useEffect(() => {
+    if (hasRestoredRef.current) return;
+    hasRestoredRef.current = true;
+
+    const restoreSessions = async () => {
+      // If initialTabs provided, use those
+      if (initialTabs && initialTabs.length > 0) {
+        setTabs(initialTabs);
+        setActiveTabId(initialTabs.find(t => t.isActive)?.id || initialTabs[0]?.id);
+        setIsRestoring(false);
+        return;
+      }
+
+      // Try to restore existing sessions if we have listTerminalSessions and contextPrefix
+      if (terminalActions.listTerminalSessions && contextPrefix) {
+        try {
+          const sessions = await terminalActions.listTerminalSessions();
+          // Filter sessions that belong to this tabbed terminal (match context prefix)
+          const matchingSessions = sessions.filter(s =>
+            s.context && s.context.startsWith(contextPrefix + ':')
+          );
+
+          if (matchingSessions.length > 0) {
+            // Restore tabs from existing sessions
+            const restoredTabs: TerminalTab[] = matchingSessions.map((session, index) => {
+              // Extract tab ID from context (format: prefix:tabId)
+              const tabId = session.context?.split(':').pop() || `restored-${index}`;
+              return {
+                id: tabId,
+                label: session.directory?.split('/').pop() || 'Terminal',
+                directory: session.directory,
+                isActive: index === 0,
+              };
+            });
+
+            // Build session ID map
+            const restoredSessionIds = new Map<string, string>();
+            matchingSessions.forEach((session, index) => {
+              const tabId = session.context?.split(':').pop() || `restored-${index}`;
+              restoredSessionIds.set(tabId, session.id);
+            });
+
+            setTabs(restoredTabs);
+            setActiveTabId(restoredTabs[0]?.id || '');
+            setSessionIds(restoredSessionIds);
+            setIsRestoring(false);
+            return;
+          }
+        } catch (e) {
+          console.warn('[TabbedGhosttyTerminal] Failed to restore sessions:', e);
+        }
+      }
+
+      // No existing sessions or restoration failed - create initial tab
+      const initialTab: TerminalTab = {
+        id: `tab-${Date.now()}`,
+        label: terminalDirectory?.split('/').pop() || 'Terminal',
+        directory: terminalDirectory || undefined,
+        isActive: true,
+      };
+      setTabs([initialTab]);
+      setActiveTabId(initialTab.id);
+      setIsRestoring(false);
+    };
+
+    restoreSessions();
+  }, [initialTabs, terminalActions, contextPrefix, terminalDirectory]);
+
   // Notify parent of tab changes
   useEffect(() => {
-    onTabsChange?.(tabs);
-  }, [tabs, onTabsChange]);
+    if (!isRestoring && tabs.length > 0) {
+      onTabsChange?.(tabs);
+    }
+  }, [tabs, onTabsChange, isRestoring]);
 
   // Add new tab
   const addNewTab = useCallback(() => {
@@ -464,6 +549,27 @@ export const TabbedGhosttyTerminal: React.FC<TabbedGhosttyTerminalProps> = ({
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
   }, [addNewTab, closeTab, switchTab]);
+
+  // Show loading state while restoring
+  if (isRestoring) {
+    return (
+      <div
+        style={{
+          height: '100%',
+          width: '100%',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          backgroundColor: '#1e1e1e',
+          color: '#888',
+          fontFamily: 'JetBrains Mono, Menlo, Monaco, monospace',
+          fontSize: '14px',
+        }}
+      >
+        Loading terminals...
+      </div>
+    );
+  }
 
   return (
     <div style={{ height: '100%', width: '100%', display: 'flex', flexDirection: 'column', backgroundColor: '#1e1e1e' }}>
