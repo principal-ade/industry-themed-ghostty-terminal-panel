@@ -1,809 +1,726 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Terminal, FitAddon } from 'ghostty-web';
-import { Plus, X } from 'lucide-react';
-import type { PanelComponentProps, PanelEvent, TerminalActions, PortReadyData } from '../types';
-
-// Terminal session info returned from list
-interface TerminalSessionInfo {
-  id: string;
-  directory: string;
-  context?: string;
-}
-
-// Extend TerminalActions with listTerminalSessions for restoration
-interface ExtendedTerminalActions extends TerminalActions {
-  listTerminalSessions?: () => Promise<TerminalSessionInfo[]>;
-}
-
-/**
- * Terminal tab representation
- */
-export interface TerminalTab {
-  id: string;
-  label: string;
-  directory?: string;
-  isActive: boolean;
-}
-
-/**
- * Props for TabbedGhosttyTerminal
- */
-export interface TabbedGhosttyTerminalProps extends PanelComponentProps {
-  initialTabs?: TerminalTab[];
-  onTabsChange?: (tabs: TerminalTab[]) => void;
-  /**
-   * Context prefix used to filter and restore existing terminal sessions.
-   * Sessions with context starting with this prefix will be restored as tabs.
-   * New tabs will use this prefix + tab ID as their context.
-   */
-  contextPrefix?: string;
-}
+import { Plus, X, Terminal as TerminalIcon } from 'lucide-react';
+import { useTheme } from '@principal-ade/industry-theme';
+import type {
+  TabbedGhosttyTerminalProps,
+  TerminalTab,
+  TerminalSessionInfo,
+  TerminalActions,
+} from '../types';
 
 /**
  * Individual Terminal Tab Content
  * Renders a single Ghostty terminal instance for a tab
- * Uses MessagePort for high-performance data streaming when available
+ * Uses onTerminalData for session-specific data subscription
  */
-const TerminalTabContent = React.memo<{
-  tabId: string;
-  isActive: boolean;
+interface TerminalTabContentProps {
+  tab: TerminalTab;
   sessionId: string | null;
-  terminalActions: ExtendedTerminalActions;
-  events: PanelComponentProps['events'];
+  isActive: boolean;
+  isVisible: boolean;
+  actions: TerminalActions;
+  terminalContext: string;
   onSessionCreated: (tabId: string, sessionId: string) => void;
-  directory?: string;
-}>(({
-  tabId,
-  isActive,
-  sessionId,
-  terminalActions,
-  events,
-  onSessionCreated,
-  directory,
-}) => {
-  const terminalRef = useRef<HTMLDivElement>(null);
-  const terminalInstanceRef = useRef<Terminal | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
-  const resizeObserverRef = useRef<ResizeObserver | null>(null);
-  const hasInitializedRef = useRef(false);
-  const dataPortRef = useRef<MessagePort | null>(null);
+}
 
-  const [error, setError] = useState<string | null>(null);
-  const [isInitializing, setIsInitializing] = useState(!sessionId);
-  const [usingMessagePort, setUsingMessagePort] = useState(false);
+const TerminalTabContent = React.memo<TerminalTabContentProps>(
+  ({
+    tab,
+    sessionId,
+    isActive,
+    isVisible,
+    actions,
+    terminalContext,
+    onSessionCreated,
+  }) => {
+    const { theme } = useTheme();
+    const terminalRef = useRef<HTMLDivElement>(null);
+    const terminalInstanceRef = useRef<Terminal | null>(null);
+    const fitAddonRef = useRef<FitAddon | null>(null);
+    const resizeObserverRef = useRef<ResizeObserver | null>(null);
+    const hasInitializedRef = useRef(false);
 
-  // Set up MessagePort ready listener
-  useEffect(() => {
-    if (!sessionId || !terminalActions.onTerminalPortReady) return;
+    const [localSessionId, setLocalSessionId] = useState<string | null>(sessionId);
+    const [isInitialized, setIsInitialized] = useState(false);
+    const [error, setError] = useState<string | null>(null);
 
-    const handlePortReady = (data: PortReadyData, port: MessagePort) => {
-      if (data.sessionId === sessionId) {
-        console.log(`[TabbedGhosttyTerminal] Received MessagePort for tab ${tabId}, session ${sessionId}`);
-        dataPortRef.current = port;
-        port.start();
-        setUsingMessagePort(true);
-      }
-    };
-
-    const unsubscribe = terminalActions.onTerminalPortReady(handlePortReady);
-
-    return () => {
-      if (typeof unsubscribe === 'function') {
-        unsubscribe();
-      }
-    };
-  }, [sessionId, tabId, terminalActions]);
-
-  // Create terminal session on mount if not already created
-  useEffect(() => {
-    if (hasInitializedRef.current) {
-      return;
-    }
-
-    // If we already have a sessionId (restored session), just claim ownership
-    if (sessionId) {
+    // Initialize terminal session
+    useEffect(() => {
+      if (hasInitializedRef.current) return;
       hasInitializedRef.current = true;
-      const claimRestored = async () => {
+
+      let mounted = true;
+
+      const initSession = async () => {
         try {
-          // Claim ownership of the restored session
-          if (terminalActions.claimTerminalOwnership) {
-            await terminalActions.claimTerminalOwnership(sessionId, true); // force claim
+          // If we already have a session ID (restored), use it
+          if (sessionId) {
+            setLocalSessionId(sessionId);
+            setIsInitialized(true);
+
+            // Claim ownership if available
+            if (actions.claimTerminalOwnership) {
+              await actions.claimTerminalOwnership(sessionId);
+            }
+            return;
           }
-          setIsInitializing(false);
+
+          // Create new session
+          if (!actions.createTerminalSession) {
+            setError('createTerminalSession action not available');
+            return;
+          }
+
+          const newSessionId = await actions.createTerminalSession({
+            cwd: tab.directory,
+            command: tab.command,
+            context: `${terminalContext}:${tab.id}`,
+          });
+
+          if (!mounted) return;
+
+          setLocalSessionId(newSessionId);
+          setIsInitialized(true);
+          onSessionCreated(tab.id, newSessionId);
+
+          // Claim ownership if available
+          if (actions.claimTerminalOwnership) {
+            await actions.claimTerminalOwnership(newSessionId);
+          }
         } catch (err) {
-          console.warn('[TabbedGhosttyTerminal] Failed to claim restored session:', err);
-          setIsInitializing(false);
+          console.error('[TerminalTabContent] Failed to create session:', err);
+          setError(err instanceof Error ? err.message : String(err));
         }
       };
-      claimRestored();
-      return;
-    }
 
-    hasInitializedRef.current = true;
+      initSession();
 
-    const initSession = async () => {
-      try {
-        if (!terminalActions.createTerminalSession) {
-          throw new Error('Terminal actions not available');
-        }
+      return () => {
+        mounted = false;
+      };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
-        // Pass tabId as context to ensure unique session per tab
-        const id = await terminalActions.createTerminalSession({
-          cwd: directory || undefined,
-          context: tabId,
-        });
+    // Initialize Ghostty terminal UI when we have a session and are active
+    useEffect(() => {
+      if (!terminalRef.current || !localSessionId || !isActive) return;
+      if (terminalInstanceRef.current) return; // Already initialized
 
-        // Claim ownership
-        if (terminalActions.claimTerminalOwnership) {
-          await terminalActions.claimTerminalOwnership(id);
-        }
+      const init = async () => {
+        try {
+          const term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: theme.fonts.monospace || 'JetBrains Mono, Menlo, Monaco, monospace',
+            theme: {
+              background: theme.colors.background,
+              foreground: theme.colors.text,
+              cursor: theme.colors.text,
+            },
+          });
 
-        onSessionCreated(tabId, id);
-        setIsInitializing(false);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-        setIsInitializing(false);
-      }
-    };
+          const fitAddon = new FitAddon();
+          term.loadAddon(fitAddon);
 
-    initSession();
-  }, [tabId, directory, sessionId, terminalActions, onSessionCreated]);
+          await term.open(terminalRef.current!);
+          fitAddon.fit();
 
-  // Request MessagePort after session is created
-  useEffect(() => {
-    if (!sessionId || !terminalActions.requestTerminalDataPort) {
-      return;
-    }
+          terminalInstanceRef.current = term;
+          fitAddonRef.current = fitAddon;
 
-    const requestPort = async () => {
-      try {
-        console.log(`[TabbedGhosttyTerminal] Requesting MessagePort for tab ${tabId}, session ${sessionId}`);
-        const result = await terminalActions.requestTerminalDataPort!(sessionId);
-        if (!result.success) {
-          console.warn(`[TabbedGhosttyTerminal] Failed to request MessagePort: ${result.reason}`);
-        }
-        // Port will arrive via onTerminalPortReady callback
-      } catch (error) {
-        console.error('[TabbedGhosttyTerminal] Error requesting MessagePort:', error);
-      }
-    };
-
-    requestPort();
-  }, [sessionId, tabId, terminalActions]);
-
-  // Initialize Ghostty terminal UI when we have a session and are active
-  useEffect(() => {
-    if (!terminalRef.current || !sessionId || !isActive) return;
-    if (terminalInstanceRef.current) return; // Already initialized
-
-    const init = async () => {
-      try {
-        const term = new Terminal({
-          cursorBlink: true,
-          fontSize: 14,
-          fontFamily: 'JetBrains Mono, Menlo, Monaco, monospace',
-          theme: {
-            background: '#1e1e1e',
-            foreground: '#d4d4d4',
-            cursor: '#d4d4d4',
-          },
-        });
-
-        const fitAddon = new FitAddon();
-        term.loadAddon(fitAddon);
-
-        await term.open(terminalRef.current!);
-        fitAddon.fit();
-
-        terminalInstanceRef.current = term;
-        fitAddonRef.current = fitAddon;
-
-        // Handle user input
-        term.onData((input: string) => {
-          if (terminalActions.writeToTerminal && sessionId) {
-            terminalActions.writeToTerminal(sessionId, input);
-          }
-        });
-
-        // Handle resize
-        resizeObserverRef.current = new ResizeObserver(() => {
-          if (fitAddonRef.current && terminalInstanceRef.current) {
-            fitAddonRef.current.fit();
-            if (terminalActions.resizeTerminal && sessionId) {
-              terminalActions.resizeTerminal(
-                sessionId,
-                terminalInstanceRef.current.cols,
-                terminalInstanceRef.current.rows
-              );
+          // Handle user input
+          term.onData((input: string) => {
+            if (actions.writeToTerminal && localSessionId) {
+              actions.writeToTerminal(localSessionId, input);
             }
-          }
-        });
-        resizeObserverRef.current.observe(terminalRef.current!);
+          });
 
-        // Refresh to get existing buffer after terminal is ready
-        if (terminalActions.refreshTerminal) {
+          // Handle resize
+          resizeObserverRef.current = new ResizeObserver(() => {
+            if (fitAddonRef.current && terminalInstanceRef.current) {
+              fitAddonRef.current.fit();
+              if (actions.resizeTerminal && localSessionId) {
+                actions.resizeTerminal(
+                  localSessionId,
+                  terminalInstanceRef.current.cols,
+                  terminalInstanceRef.current.rows
+                );
+              }
+            }
+          });
+          resizeObserverRef.current.observe(terminalRef.current!);
+
+          // Refresh to get existing buffer after terminal is ready
+          if (actions.refreshTerminal) {
+            setTimeout(async () => {
+              try {
+                await actions.refreshTerminal!(localSessionId);
+              } catch (e) {
+                console.warn('[TerminalTabContent] Failed to refresh:', e);
+              }
+            }, 200);
+          }
+        } catch (err) {
+          console.error('[TerminalTabContent] Failed to initialize Ghostty:', err);
+          setError(err instanceof Error ? err.message : 'Failed to initialize terminal');
+        }
+      };
+
+      init();
+
+      return () => {
+        if (resizeObserverRef.current) {
+          resizeObserverRef.current.disconnect();
+          resizeObserverRef.current = null;
+        }
+        if (terminalInstanceRef.current) {
+          terminalInstanceRef.current.dispose();
+          terminalInstanceRef.current = null;
+        }
+        fitAddonRef.current = null;
+      };
+    }, [localSessionId, isActive, actions, theme]);
+
+    // Subscribe to terminal data using onTerminalData
+    useEffect(() => {
+      if (!localSessionId || !isInitialized) return;
+      if (!actions.onTerminalData) {
+        console.error('[TerminalTabContent] onTerminalData not available');
+        return;
+      }
+
+      const unsubscribe = actions.onTerminalData(localSessionId, (data: string) => {
+        if (terminalInstanceRef.current) {
+          terminalInstanceRef.current.write(data);
+        }
+      });
+
+      return () => {
+        unsubscribe();
+      };
+    }, [localSessionId, isInitialized, actions]);
+
+    // Focus terminal and refresh when tab becomes active
+    useEffect(() => {
+      if (isActive && terminalInstanceRef.current && localSessionId) {
+        terminalInstanceRef.current.focus();
+        // Refit on activation
+        if (fitAddonRef.current) {
+          fitAddonRef.current.fit();
+        }
+        // Refresh to get buffer contents when switching to this tab
+        if (actions.refreshTerminal) {
           setTimeout(async () => {
             try {
-              await terminalActions.refreshTerminal!(sessionId);
+              await actions.refreshTerminal!(localSessionId);
             } catch (e) {
-              console.warn('[TabbedGhosttyTerminal] Failed to refresh:', e);
+              console.warn('[TerminalTabContent] Failed to refresh on tab switch:', e);
             }
-          }, 200);
+          }, 100);
         }
-      } catch (err) {
-        console.error('[TabbedGhosttyTerminal] Failed to initialize:', err);
-        setError(err instanceof Error ? err.message : 'Failed to initialize terminal');
       }
-    };
+    }, [isActive, localSessionId, actions]);
 
-    init();
-
-    return () => {
-      if (resizeObserverRef.current) {
-        resizeObserverRef.current.disconnect();
-        resizeObserverRef.current = null;
-      }
-      if (terminalInstanceRef.current) {
-        terminalInstanceRef.current.dispose();
-        terminalInstanceRef.current = null;
-      }
-      fitAddonRef.current = null;
-    };
-  }, [sessionId, isActive, terminalActions]);
-
-  // HIGH-PERFORMANCE PATH: Incoming data via MessagePort
-  useEffect(() => {
-    if (!usingMessagePort || !dataPortRef.current) return;
-
-    const port = dataPortRef.current;
-
-    const handleMessage = (event: MessageEvent) => {
-      if (event.data?.type === 'DATA' && terminalInstanceRef.current) {
-        terminalInstanceRef.current.write(event.data.data);
-      }
-    };
-
-    port.addEventListener('message', handleMessage);
-    console.log(`[TabbedGhosttyTerminal] Tab ${tabId} listening on MessagePort for terminal data`);
-
-    return () => {
-      port.removeEventListener('message', handleMessage);
-    };
-  }, [usingMessagePort, tabId]);
-
-  // FALLBACK PATH: Incoming data via panel events (only if MessagePort not available)
-  useEffect(() => {
-    // Skip if using MessagePort
-    if (usingMessagePort) return;
-    if (!sessionId) return;
-
-    const handleData = (event: PanelEvent<{ sessionId?: string; data?: string }>) => {
-      if (
-        terminalInstanceRef.current &&
-        event.payload?.sessionId === sessionId &&
-        event.payload?.data
-      ) {
-        terminalInstanceRef.current.write(event.payload.data);
-      }
-    };
-
-    const handleExit = (event: PanelEvent<{ sessionId?: string; exitCode?: number }>) => {
-      if (event.payload?.sessionId === sessionId) {
-        setError(`Terminal exited with code ${event.payload.exitCode}`);
-      }
-    };
-
-    console.log(`[TabbedGhosttyTerminal] Tab ${tabId} using event fallback for terminal data`);
-    const unsubscribeData = events.on('terminal:data', handleData);
-    const unsubscribeExit = events.on('terminal:exit', handleExit);
-
-    return () => {
-      if (typeof unsubscribeData === 'function') unsubscribeData();
-      else events.off('terminal:data', handleData);
-      if (typeof unsubscribeExit === 'function') unsubscribeExit();
-      else events.off('terminal:exit', handleExit);
-    };
-  }, [events, sessionId, usingMessagePort, tabId]);
-
-  // Focus terminal and refresh when tab becomes active
-  useEffect(() => {
-    if (isActive && terminalInstanceRef.current && sessionId) {
-      terminalInstanceRef.current.focus();
-      // Refit on activation
-      if (fitAddonRef.current) {
-        fitAddonRef.current.fit();
-      }
-      // Refresh to get buffer contents when switching to this tab
-      if (terminalActions.refreshTerminal) {
-        setTimeout(async () => {
-          try {
-            await terminalActions.refreshTerminal!(sessionId);
-          } catch (e) {
-            console.warn('[TabbedGhosttyTerminal] Failed to refresh on tab switch:', e);
-          }
-        }, 100);
-      }
+    if (error) {
+      return (
+        <div
+          style={{
+            padding: '20px',
+            color: theme.colors.error || '#ef4444',
+            backgroundColor: theme.colors.background,
+            height: '100%',
+            display: isActive ? 'flex' : 'none',
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexDirection: 'column',
+            gap: '10px',
+          }}
+        >
+          <div style={{ fontSize: '16px', fontWeight: 'bold' }}>Terminal Error</div>
+          <div style={{ fontSize: '14px', opacity: 0.8 }}>{error}</div>
+        </div>
+      );
     }
-  }, [isActive, sessionId, terminalActions]);
 
-  // Cleanup MessagePort on unmount
-  useEffect(() => {
-    return () => {
-      if (dataPortRef.current) {
-        dataPortRef.current.close();
-        dataPortRef.current = null;
-      }
-    };
-  }, []);
+    if (!isInitialized) {
+      return (
+        <div
+          style={{
+            display: isActive ? 'flex' : 'none',
+            height: '100%',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: theme.colors.textSecondary,
+            backgroundColor: theme.colors.background,
+          }}
+        >
+          Initializing terminal...
+        </div>
+      );
+    }
 
-  if (error) {
     return (
       <div
+        ref={terminalRef}
         style={{
-          padding: '20px',
-          color: '#ef4444',
-          backgroundColor: '#1e1e1e',
+          width: '100%',
           height: '100%',
-          display: isActive ? 'flex' : 'none',
-          alignItems: 'center',
-          justifyContent: 'center',
-          flexDirection: 'column',
-          gap: '10px',
+          display: isActive ? 'block' : 'none',
+          backgroundColor: theme.colors.background,
         }}
-      >
-        <div style={{ fontSize: '16px', fontWeight: 'bold' }}>Terminal Error</div>
-        <div style={{ fontSize: '14px', opacity: 0.8 }}>{error}</div>
-      </div>
+      />
     );
   }
-
-  if (isInitializing) {
-    return (
-      <div
-        style={{
-          padding: '20px',
-          color: '#a0a0a0',
-          backgroundColor: '#1e1e1e',
-          height: '100%',
-          display: isActive ? 'flex' : 'none',
-          alignItems: 'center',
-          justifyContent: 'center',
-        }}
-      >
-        Initializing terminal...
-      </div>
-    );
-  }
-
-  return (
-    <div
-      ref={terminalRef}
-      style={{
-        width: '100%',
-        height: '100%',
-        display: isActive ? 'block' : 'none',
-        backgroundColor: '#1e1e1e',
-      }}
-    />
-  );
-});
+);
 
 TerminalTabContent.displayName = 'TerminalTabContent';
 
 /**
- * TabbedGhosttyTerminal Panel
+ * TabbedGhosttyTerminal Component
  *
- * A multi-tab terminal panel using the Ghostty WebAssembly engine.
- * Uses MessagePort for high-performance data streaming when available.
+ * A tabbed terminal panel using the Ghostty WebAssembly engine.
+ * Uses onTerminalData for session-specific data subscription, avoiding
+ * the MessagePort timing issues.
  *
- * Supports keyboard shortcuts for tab management:
- * - Cmd/Ctrl + T: New tab
- * - Cmd/Ctrl + W: Close current tab
- * - Cmd/Ctrl + 1-9: Switch to tab 1-9 (9 = last tab)
+ * Features:
+ * - Multiple terminal tabs
+ * - Session restoration from existing terminals
+ * - Keyboard shortcuts (Cmd+T, Cmd+W, Cmd+1-9)
+ * - Session persistence across tab switches
  */
 export const TabbedGhosttyTerminal: React.FC<TabbedGhosttyTerminalProps> = ({
+  context: _context,
   actions,
-  events,
-  context,
-  initialTabs,
+  events: _events,
+  terminalContext,
+  directory,
+  hideHeader = false,
+  isVisible = true,
   onTabsChange,
-  contextPrefix,
+  initialTabs = [],
+  showAllTerminals = false,
+  onShowAllTerminalsChange: _onShowAllTerminalsChange,
 }) => {
-  // Get terminal directory from context
-  const terminalDirectory =
-    (context as { repositoryPath?: string })?.repositoryPath ||
-    context?.currentScope?.repository?.path;
-
-  const terminalActions = actions as typeof actions & ExtendedTerminalActions;
-
-  // Tab state - start empty, will be populated by restoration or initial tab creation
-  const [tabs, setTabs] = useState<TerminalTab[]>([]);
-  const [activeTabId, setActiveTabId] = useState<string>('');
-  const [isRestoring, setIsRestoring] = useState(true);
-
-  // Session tracking: Map<tabId, sessionId>
+  const { theme } = useTheme();
+  const [tabs, setTabs] = useState<TerminalTab[]>(initialTabs);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [sessionIds, setSessionIds] = useState<Map<string, string>>(new Map());
+  const [hoveredTabId, setHoveredTabId] = useState<string | null>(null);
 
-  // Refs for stable callbacks
-  const tabsRef = useRef(tabs);
-  const activeTabIdRef = useRef(activeTabId);
+  // Track initialization
+  const hasInitializedRef = useRef(false);
   const isCreatingTabRef = useRef(false);
-  const hasRestoredRef = useRef(false);
 
-  // Keep refs in sync
-  useEffect(() => {
-    tabsRef.current = tabs;
-    activeTabIdRef.current = activeTabId;
-  }, [tabs, activeTabId]);
+  // Restore sessions from existing terminals
+  const restoreSessions = useCallback(async () => {
+    try {
+      let sessions: TerminalSessionInfo[] = [];
 
-  // Restore existing sessions or create initial tab
-  useEffect(() => {
-    if (hasRestoredRef.current) return;
-    hasRestoredRef.current = true;
+      // Try to list sessions via action
+      if (actions.listTerminalSessions) {
+        sessions = await actions.listTerminalSessions();
+      }
 
-    const restoreSessions = async () => {
-      // If initialTabs provided, use those
-      if (initialTabs && initialTabs.length > 0) {
+      // Filter sessions by context (or show all if showAllTerminals is true)
+      const ourSessions = sessions.filter(
+        (session) =>
+          showAllTerminals ||
+          session.context?.startsWith(terminalContext)
+      );
+
+      if (ourSessions.length > 0 && initialTabs.length === 0) {
+        const restoredTabs: TerminalTab[] = [];
+        const restoredSessionIds = new Map<string, string>();
+
+        ourSessions.forEach((session, index) => {
+          const tabId = `tab-restored-${session.id}`;
+          const tab: TerminalTab = {
+            id: tabId,
+            label: session.cwd.split('/').pop() || session.cwd,
+            directory: session.cwd,
+            isActive: index === 0,
+          };
+
+          restoredTabs.push(tab);
+          restoredSessionIds.set(tabId, session.id);
+        });
+
+        setTabs(restoredTabs);
+        setSessionIds(restoredSessionIds);
+        setActiveTabId(restoredTabs[0]?.id || null);
+        onTabsChange?.(restoredTabs);
+
+        console.info(`[TabbedGhosttyTerminal] Restored ${restoredTabs.length} tabs`);
+      } else if (initialTabs.length > 0) {
         setTabs(initialTabs);
-        setActiveTabId(initialTabs.find(t => t.isActive)?.id || initialTabs[0]?.id);
-        setIsRestoring(false);
-        return;
+        setActiveTabId(
+          initialTabs.find((t) => t.isActive)?.id || initialTabs[0]?.id || null
+        );
       }
-
-      // Try to restore existing sessions if we have listTerminalSessions and contextPrefix
-      if (terminalActions.listTerminalSessions && contextPrefix) {
-        try {
-          const sessions = await terminalActions.listTerminalSessions();
-          // Filter sessions that belong to this tabbed terminal (match context prefix)
-          const matchingSessions = sessions.filter(s =>
-            s.context && s.context.startsWith(contextPrefix + ':')
-          );
-
-          if (matchingSessions.length > 0) {
-            // Restore tabs from existing sessions
-            const restoredTabs: TerminalTab[] = matchingSessions.map((session, index) => {
-              // Extract tab ID from context (format: prefix:tabId)
-              const tabId = session.context?.split(':').pop() || `restored-${index}`;
-              return {
-                id: tabId,
-                label: session.directory?.split('/').pop() || 'Terminal',
-                directory: session.directory,
-                isActive: index === 0,
-              };
-            });
-
-            // Build session ID map
-            const restoredSessionIds = new Map<string, string>();
-            matchingSessions.forEach((session, index) => {
-              const tabId = session.context?.split(':').pop() || `restored-${index}`;
-              restoredSessionIds.set(tabId, session.id);
-            });
-
-            setTabs(restoredTabs);
-            setActiveTabId(restoredTabs[0]?.id || '');
-            setSessionIds(restoredSessionIds);
-            setIsRestoring(false);
-            return;
-          }
-        } catch (e) {
-          console.warn('[TabbedGhosttyTerminal] Failed to restore sessions:', e);
-        }
-      }
-
-      // No existing sessions or restoration failed - create initial tab
-      const initialTab: TerminalTab = {
-        id: `tab-${Date.now()}`,
-        label: terminalDirectory?.split('/').pop() || 'Terminal',
-        directory: terminalDirectory || undefined,
-        isActive: true,
-      };
-      setTabs([initialTab]);
-      setActiveTabId(initialTab.id);
-      setIsRestoring(false);
-    };
-
-    restoreSessions();
-  }, [initialTabs, terminalActions, contextPrefix, terminalDirectory]);
-
-  // Notify parent of tab changes
-  useEffect(() => {
-    if (!isRestoring && tabs.length > 0) {
-      onTabsChange?.(tabs);
+    } catch (err) {
+      console.error('[TabbedGhosttyTerminal] Failed to restore sessions:', err);
     }
-  }, [tabs, onTabsChange, isRestoring]);
+  }, [terminalContext, showAllTerminals, initialTabs, onTabsChange, actions]);
 
-  // Add new tab
-  const addNewTab = useCallback(() => {
-    const newTab: TerminalTab = {
-      id: `tab-${Date.now()}`,
-      label: terminalDirectory?.split('/').pop() || 'Terminal',
-      directory: terminalDirectory || undefined,
-      isActive: true,
-    };
+  // Initialize on mount
+  useEffect(() => {
+    if (hasInitializedRef.current) return;
+    hasInitializedRef.current = true;
 
-    setTabs(prev => prev.map(t => ({ ...t, isActive: false })).concat(newTab));
-    setActiveTabId(newTab.id);
-  }, [terminalDirectory]);
+    console.info('[TabbedGhosttyTerminal] Initializing...');
+    restoreSessions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // Switch to tab
+  // Switch to a tab
   const switchTab = useCallback((tabId: string) => {
-    setTabs(prev => prev.map(t => ({
-      ...t,
-      isActive: t.id === tabId,
-    })));
+    setTabs((prevTabs) =>
+      prevTabs.map((t) => ({
+        ...t,
+        isActive: t.id === tabId,
+      }))
+    );
     setActiveTabId(tabId);
   }, []);
 
-  // Close tab
-  const closeTab = useCallback((tabId: string) => {
-    const currentTabs = tabsRef.current;
+  // Create a new tab
+  const addNewTab = useCallback(
+    (label?: string, command?: string, targetDirectory?: string) => {
+      const targetDir = targetDirectory || directory;
+      const directoryName = targetDir.split('/').pop() || targetDir;
+      const newTab: TerminalTab = {
+        id: `tab-${Date.now()}`,
+        label: label || directoryName,
+        directory: targetDir,
+        command,
+        isActive: true,
+      };
 
-    if (currentTabs.length <= 1) return;
+      setTabs((prevTabs) => {
+        const updatedTabs = prevTabs.map((t) => ({ ...t, isActive: false }));
+        const newTabs = [...updatedTabs, newTab];
+        onTabsChange?.(newTabs);
+        return newTabs;
+      });
 
-    // Destroy session if exists
-    const sessionId = sessionIds.get(tabId);
-    if (sessionId && terminalActions.destroyTerminalSession) {
-      terminalActions.destroyTerminalSession(sessionId);
-    }
+      setActiveTabId(newTab.id);
+    },
+    [directory, onTabsChange]
+  );
 
-    setSessionIds(prev => {
-      const next = new Map(prev);
-      next.delete(tabId);
-      return next;
-    });
-
-    const closingActive = activeTabIdRef.current === tabId;
-    const tabIndex = currentTabs.findIndex(t => t.id === tabId);
-
-    setTabs(prev => {
-      const filtered = prev.filter(t => t.id !== tabId);
-      if (closingActive && filtered.length > 0) {
-        const newActiveIndex = Math.max(0, tabIndex - 1);
-        return filtered.map((t, i) => ({
-          ...t,
-          isActive: i === newActiveIndex,
-        }));
+  // Close a tab
+  const closeTab = useCallback(
+    async (tabId: string) => {
+      const sessionId = sessionIds.get(tabId);
+      if (sessionId && actions.destroyTerminalSession) {
+        try {
+          await actions.destroyTerminalSession(sessionId);
+        } catch (err) {
+          console.error('[TabbedGhosttyTerminal] Failed to destroy session:', err);
+        }
+        setSessionIds((prev) => {
+          const newMap = new Map(prev);
+          newMap.delete(tabId);
+          return newMap;
+        });
       }
-      return filtered;
-    });
 
-    if (closingActive) {
-      const newTabs = currentTabs.filter(t => t.id !== tabId);
-      const newActiveIndex = Math.max(0, tabIndex - 1);
-      if (newTabs[newActiveIndex]) {
-        setActiveTabId(newTabs[newActiveIndex].id);
-      }
-    }
-  }, [sessionIds, terminalActions]);
+      setTabs((prevTabs) => {
+        const newTabs = prevTabs.filter((t) => t.id !== tabId);
 
-  // Handle session created callback
+        if (activeTabId === tabId && newTabs.length > 0) {
+          const newActiveTab = newTabs[newTabs.length - 1];
+          newActiveTab.isActive = true;
+          setActiveTabId(newActiveTab.id);
+        } else if (newTabs.length === 0) {
+          setActiveTabId(null);
+        }
+
+        onTabsChange?.(newTabs);
+        return newTabs;
+      });
+    },
+    [activeTabId, sessionIds, actions, onTabsChange]
+  );
+
+  // Handle session creation callback
   const handleSessionCreated = useCallback((tabId: string, sessionId: string) => {
-    setSessionIds(prev => new Map(prev).set(tabId, sessionId));
+    setSessionIds((prev) => new Map(prev).set(tabId, sessionId));
   }, []);
+
+  // Store refs for keyboard handler
+  const tabsRef = useRef(tabs);
+  const activeTabIdRef = useRef(activeTabId);
+  const addNewTabRef = useRef(addNewTab);
+  const closeTabRef = useRef(closeTab);
+  const switchTabRef = useRef(switchTab);
+
+  useEffect(() => {
+    tabsRef.current = tabs;
+    activeTabIdRef.current = activeTabId;
+    addNewTabRef.current = addNewTab;
+    closeTabRef.current = closeTab;
+    switchTabRef.current = switchTab;
+  }, [tabs, activeTabId, addNewTab, closeTab, switchTab]);
 
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      const isMod = e.metaKey || e.ctrlKey;
-
-      // Cmd/Ctrl + T: New tab
-      if (isMod && e.key === 't') {
+      // Cmd/Ctrl + T to open new tab
+      if ((e.metaKey || e.ctrlKey) && e.key === 't') {
         e.preventDefault();
         e.stopPropagation();
 
         if (isCreatingTabRef.current) return;
         isCreatingTabRef.current = true;
-        addNewTab();
+        addNewTabRef.current?.();
         setTimeout(() => {
           isCreatingTabRef.current = false;
         }, 500);
         return;
       }
 
-      // Cmd/Ctrl + W: Close tab
-      if (isMod && e.key === 'w') {
-        e.preventDefault();
-        e.stopPropagation();
-        closeTab(activeTabIdRef.current);
-        return;
-      }
-
-      // Cmd/Ctrl + 1-9: Switch tabs
-      if (isMod && e.key >= '1' && e.key <= '9') {
-        e.preventDefault();
-        e.stopPropagation();
-
+      // Cmd/Ctrl + W to close active tab
+      if ((e.metaKey || e.ctrlKey) && e.key === 'w') {
+        const currentActiveTabId = activeTabIdRef.current;
         const currentTabs = tabsRef.current;
-        const tabIndex = e.key === '9'
-          ? currentTabs.length - 1
-          : parseInt(e.key) - 1;
-
-        if (currentTabs[tabIndex]) {
-          switchTab(currentTabs[tabIndex].id);
+        if (currentActiveTabId && currentTabs.length > 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          closeTabRef.current?.(currentActiveTabId);
         }
         return;
       }
+
+      // Cmd/Ctrl + number (1-9) to switch tabs
+      if ((e.metaKey || e.ctrlKey) && e.key >= '1' && e.key <= '9') {
+        e.preventDefault();
+        const currentTabs = tabsRef.current;
+        const keyNum = parseInt(e.key, 10);
+        const tabIndex = keyNum === 9 ? currentTabs.length - 1 : keyNum - 1;
+
+        if (tabIndex >= 0 && tabIndex < currentTabs.length) {
+          const targetTab = currentTabs[tabIndex];
+          if (targetTab) {
+            switchTabRef.current?.(targetTab.id);
+          }
+        }
+      }
     };
 
-    window.addEventListener('keydown', handleKeyDown, true);
-    return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [addNewTab, closeTab, switchTab]);
-
-  // Show loading state while restoring
-  if (isRestoring) {
-    return (
-      <div
-        style={{
-          height: '100%',
-          width: '100%',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          backgroundColor: '#1e1e1e',
-          color: '#888',
-          fontFamily: 'JetBrains Mono, Menlo, Monaco, monospace',
-          fontSize: '14px',
-        }}
-      >
-        Loading terminals...
-      </div>
-    );
-  }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   return (
-    <div style={{ height: '100%', width: '100%', display: 'flex', flexDirection: 'column', backgroundColor: '#1e1e1e' }}>
-      {/* Tab Bar */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          backgroundColor: '#252526',
-          borderBottom: '1px solid #3c3c3c',
-          minHeight: '36px',
-          overflow: 'hidden',
-        }}
-      >
-        {/* Tabs */}
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        height: '100%',
+        backgroundColor: theme.colors.background,
+      }}
+    >
+      {/* Tab bar */}
+      {!hideHeader && (
         <div
           style={{
             display: 'flex',
-            flex: 1,
-            overflow: 'hidden',
-            gap: '2px',
-            padding: '4px 4px 0 4px',
+            alignItems: 'stretch',
+            height: '41px',
+            flexShrink: 0,
+            boxSizing: 'border-box',
           }}
         >
-          {tabs.map((tab, index) => (
-            <div
-              key={tab.id}
-              onClick={() => switchTab(tab.id)}
+          {/* Tabs container */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              flex: 1,
+              overflow: 'hidden',
+              borderBottom: `1px solid ${theme.colors.border}`,
+              boxSizing: 'border-box',
+            }}
+          >
+            {tabs.map((tab) => (
+              <div
+                key={tab.id}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  switchTab(tab.id);
+                }}
+                onMouseEnter={() => setHoveredTabId(tab.id)}
+                onMouseLeave={() => setHoveredTabId(null)}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '6px',
+                  padding: '6px 8px',
+                  backgroundColor: tab.isActive
+                    ? theme.colors.background
+                    : theme.colors.backgroundSecondary,
+                  borderBottom: `1px solid ${theme.colors.border}`,
+                  cursor: 'pointer',
+                  fontSize: theme.fontSizes[1],
+                  fontWeight: tab.isActive
+                    ? theme.fontWeights.semibold
+                    : theme.fontWeights.body,
+                  fontFamily: theme.fonts.body,
+                  color: tab.isActive
+                    ? theme.colors.text
+                    : theme.colors.textSecondary,
+                  whiteSpace: 'nowrap',
+                  transition: 'all 0.2s',
+                  flex: 1,
+                  minWidth: 0,
+                  height: '100%',
+                  position: 'relative',
+                  boxSizing: 'border-box',
+                }}
+              >
+                {hoveredTabId === tab.id && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeTab(tab.id);
+                    }}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      width: '16px',
+                      height: '16px',
+                      borderRadius: '3px',
+                      border: 'none',
+                      backgroundColor: 'transparent',
+                      cursor: 'pointer',
+                      color: theme.colors.textSecondary,
+                      padding: 0,
+                      position: 'absolute',
+                      left: '8px',
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.backgroundColor =
+                        theme.colors.backgroundTertiary;
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.backgroundColor = 'transparent';
+                    }}
+                  >
+                    <X size={12} />
+                  </button>
+                )}
+                <span title={tab.directory}>{tab.label}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Action buttons */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              borderLeft: `1px solid ${theme.colors.border}`,
+              borderBottom: `1px solid ${theme.colors.border}`,
+              boxSizing: 'border-box',
+            }}
+          >
+            {/* Add new tab button */}
+            <button
+              onClick={() => addNewTab()}
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                gap: '6px',
-                padding: '6px 12px',
-                backgroundColor: tab.isActive ? '#1e1e1e' : 'transparent',
-                color: tab.isActive ? '#d4d4d4' : '#888',
-                borderRadius: '6px 6px 0 0',
+                justifyContent: 'center',
+                width: '36px',
+                height: '100%',
+                border: 'none',
+                backgroundColor: 'transparent',
                 cursor: 'pointer',
-                fontSize: '12px',
-                fontFamily: 'JetBrains Mono, Menlo, Monaco, monospace',
-                transition: 'background-color 0.15s',
-                borderBottom: tab.isActive ? '2px solid #0e639c' : '2px solid transparent',
-                flex: 1,
-                minWidth: 0, // Allow shrinking below content size
+                color: theme.colors.textSecondary,
               }}
               onMouseEnter={(e) => {
-                if (!tab.isActive) {
-                  e.currentTarget.style.backgroundColor = '#2a2d2e';
-                }
+                e.currentTarget.style.backgroundColor =
+                  theme.colors.backgroundTertiary;
               }}
               onMouseLeave={(e) => {
-                if (!tab.isActive) {
-                  e.currentTarget.style.backgroundColor = 'transparent';
-                }
+                e.currentTarget.style.backgroundColor = 'transparent';
               }}
+              title="New terminal (Cmd+T)"
             >
-              {/* Tab label - centered */}
-              <span
-                style={{
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  flex: 1,
-                  textAlign: 'center',
-                }}
-              >
-                {tab.label}
-              </span>
-
-              {/* Close button */}
-              {tabs.length > 1 && (
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeTab(tab.id);
-                  }}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    width: '16px',
-                    height: '16px',
-                    padding: 0,
-                    border: 'none',
-                    backgroundColor: 'transparent',
-                    color: '#666',
-                    cursor: 'pointer',
-                    borderRadius: '4px',
-                    transition: 'all 0.15s',
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.backgroundColor = '#ff6b6b33';
-                    e.currentTarget.style.color = '#ff6b6b';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.backgroundColor = 'transparent';
-                    e.currentTarget.style.color = '#666';
-                  }}
-                  title="Close tab (⌘W)"
-                >
-                  <X size={12} />
-                </button>
-              )}
-            </div>
-          ))}
+              <Plus size={14} />
+            </button>
+          </div>
         </div>
+      )}
 
-        {/* New Tab Button */}
-        <button
-          onClick={addNewTab}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            width: '28px',
-            height: '28px',
-            margin: '0 8px',
-            padding: 0,
-            border: 'none',
-            backgroundColor: 'transparent',
-            color: '#888',
-            cursor: 'pointer',
-            borderRadius: '4px',
-            transition: 'all 0.15s',
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.backgroundColor = '#3c3c3c';
-            e.currentTarget.style.color = '#d4d4d4';
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.backgroundColor = 'transparent';
-            e.currentTarget.style.color = '#888';
-          }}
-          title="New tab (⌘T)"
-        >
-          <Plus size={16} />
-        </button>
-      </div>
-
-      {/* Terminal Content Area */}
-      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+      {/* Terminal content */}
+      <div
+        style={{
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+          width: '100%',
+          minHeight: 0,
+        }}
+      >
         {tabs.map((tab) => (
           <TerminalTabContent
             key={tab.id}
-            tabId={tab.id}
-            isActive={tab.id === activeTabId}
+            tab={tab}
             sessionId={sessionIds.get(tab.id) || null}
-            terminalActions={terminalActions}
-            events={events}
+            isActive={tab.id === activeTabId}
+            isVisible={isVisible}
+            actions={actions}
+            terminalContext={terminalContext}
             onSessionCreated={handleSessionCreated}
-            directory={tab.directory}
           />
         ))}
+
+        {/* Empty state */}
+        {tabs.length === 0 && (
+          <div
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              height: '100%',
+              color: theme.colors.textSecondary,
+            }}
+          >
+            <TerminalIcon
+              size={32}
+              style={{ opacity: 0.5, marginBottom: '16px' }}
+            />
+            <p>No terminal sessions</p>
+            <button
+              onClick={() => addNewTab()}
+              style={{
+                marginTop: '16px',
+                padding: '8px 16px',
+                backgroundColor: theme.colors.primary,
+                color: theme.colors.background,
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: theme.fontSizes[1],
+                fontFamily: theme.fonts.body,
+              }}
+            >
+              New Terminal
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
 };
+
+TabbedGhosttyTerminal.displayName = 'TabbedGhosttyTerminal';
 
 export default TabbedGhosttyTerminal;

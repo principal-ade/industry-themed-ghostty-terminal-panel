@@ -1,10 +1,13 @@
 import { GhosttyTerminal } from './panels/GhosttyTerminal';
-import { TabbedGhosttyTerminal } from './panels/TabbedGhosttyTerminal';
 import type { PanelDefinition, PanelContextValue } from './types';
 
 /**
  * Export array of panel definitions.
  * This is the required export for panel extensions.
+ *
+ * Note: TabbedGhosttyTerminal is not included here because it requires
+ * additional props (terminalContext, directory) that the host must provide.
+ * Use TabbedGhosttyTerminal directly for tabbed terminal functionality.
  */
 export const panels: PanelDefinition[] = [
   {
@@ -40,32 +43,6 @@ export const panels: PanelDefinition[] = [
       // The host should be notified to clean up the PTY process
     },
   },
-  {
-    metadata: {
-      id: 'com.ghostty.tabbed-terminal-panel',
-      name: 'Tabbed Ghostty Terminal',
-      icon: '📑',
-      version: '0.1.0',
-      author: 'Ghostty Integration',
-      description:
-        'Multi-tab terminal panel with keyboard shortcuts (⌘T, ⌘W, ⌘1-9) using Ghostty rendering engine',
-      slices: ['terminal'],
-    },
-    component: TabbedGhosttyTerminal,
-
-    onMount: async (context: PanelContextValue) => {
-      // eslint-disable-next-line no-console
-      console.log(
-        'Tabbed Ghostty Terminal mounted',
-        context.currentScope.repository?.path
-      );
-    },
-
-    onUnmount: async (_context: PanelContextValue) => {
-      // eslint-disable-next-line no-console
-      console.log('Tabbed Ghostty Terminal unmounting');
-    },
-  },
 ];
 
 /**
@@ -89,7 +66,6 @@ export const onPackageUnload = async () => {
 // Re-export components for direct use
 export { GhosttyTerminal } from './panels/GhosttyTerminal';
 export { TabbedGhosttyTerminal } from './panels/TabbedGhosttyTerminal';
-export type { TerminalTab, TabbedGhosttyTerminalProps } from './panels/TabbedGhosttyTerminal';
 
 // Re-export types
 export type {
@@ -99,6 +75,10 @@ export type {
   PanelActions,
   PanelEventEmitter,
   PanelEvent,
-  TerminalTab as TerminalTabType,
-  TabbedGhosttyTerminalProps as TabbedTerminalProps,
+  TerminalTab,
+  TabbedGhosttyTerminalProps,
+  TerminalActions,
+  TerminalSessionInfo,
+  CreateTerminalSessionOptions,
+  GhosttyTerminalProps,
 } from './types';

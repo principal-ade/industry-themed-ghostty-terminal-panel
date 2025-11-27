@@ -91,7 +91,9 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
       if (data.sessionId === sessionId) {
         console.log(`[GhosttyTerminal] Received MessagePort for session ${sessionId}`);
         dataPortRef.current = port;
-        port.start();
+        if (typeof port.start === 'function') {
+          port.start();
+        }
         setUsingMessagePort(true);
       }
     };
@@ -219,7 +221,9 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
 
         // Clean up MessagePort when ownership is lost
         if (dataPortRef.current) {
-          dataPortRef.current.close();
+          if (typeof dataPortRef.current.close === 'function') {
+            dataPortRef.current.close();
+          }
           dataPortRef.current = null;
           setUsingMessagePort(false);
         }
@@ -342,11 +346,12 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
       }
     };
 
-    port.addEventListener('message', handleMessage);
+    // Electron's MessagePort uses onmessage, not addEventListener
+    port.onmessage = handleMessage;
     console.log('[GhosttyTerminal] Listening on MessagePort for terminal data');
 
     return () => {
-      port.removeEventListener('message', handleMessage);
+      port.onmessage = null;
     };
   }, [usingMessagePort]);
 
@@ -384,7 +389,9 @@ export const GhosttyTerminal: React.FC<PanelComponentProps> = ({
   useEffect(() => {
     return () => {
       if (dataPortRef.current) {
-        dataPortRef.current.close();
+        if (typeof dataPortRef.current.close === 'function') {
+          dataPortRef.current.close();
+        }
         dataPortRef.current = null;
       }
     };

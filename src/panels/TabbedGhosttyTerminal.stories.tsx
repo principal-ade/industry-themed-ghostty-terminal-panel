@@ -1,409 +1,441 @@
 import type { Meta, StoryObj } from '@storybook/react';
-import React, { useEffect, useRef, useState } from 'react';
-import { TabbedGhosttyTerminal, type TerminalTab } from './TabbedGhosttyTerminal';
+import React from 'react';
+import { ThemeProvider } from '@principal-ade/industry-theme';
+import { TabbedGhosttyTerminal } from './TabbedGhosttyTerminal';
+import { createMockContext, createMockEvents } from '../mocks/panelContext';
 import type {
-  PanelContextValue,
-  PanelActions,
+  TerminalActions,
   PanelEventEmitter,
   PanelEvent,
-  PanelEventType,
+  CreateTerminalSessionOptions,
+  TerminalSessionInfo,
 } from '../types';
 
 /**
- * Create a mock event emitter with terminal data sending capability
+ * Mock Terminal Backend Simulator for TabbedGhosttyTerminal
+ *
+ * Similar to TabbedTerminalPanel's mock:
+ * - onTerminalData subscription (the key difference from MessagePort)
+ * - listTerminalSessions for session restoration
+ * - Session context tracking
  */
-const createInteractiveEvents = (): PanelEventEmitter & {
-  sendOutput: (sessionId: string, data: string) => void;
-  sendExit: (sessionId: string, exitCode: number) => void;
-} => {
-  const handlers = new Map<
-    PanelEventType,
-    Set<(event: PanelEvent<unknown>) => void>
-  >();
+class MockTabbedTerminalBackend {
+  private sessions = new Map<string, { cwd: string; shell: string; context?: string }>();
+  private sessionCounter = 0;
+  private eventEmitter: PanelEventEmitter | null = null;
+  private dataSubscribers = new Map<string, Set<(data: string) => void>>();
 
-  const emitter: PanelEventEmitter & {
-    sendOutput: (sessionId: string, data: string) => void;
-    sendExit: (sessionId: string, exitCode: number) => void;
-  } = {
-    emit: (event) => {
-      const eventHandlers = handlers.get(event.type);
-      if (eventHandlers) {
-        eventHandlers.forEach((handler) => handler(event));
-      }
-    },
-    on: (type, handler) => {
-      if (!handlers.has(type)) {
-        handlers.set(type, new Set());
-      }
-      handlers.get(type)!.add(handler as (event: PanelEvent<unknown>) => void);
-      return () => {
-        handlers.get(type)?.delete(handler as (event: PanelEvent<unknown>) => void);
-      };
-    },
-    off: (type, handler) => {
-      handlers.get(type)?.delete(handler as (event: PanelEvent<unknown>) => void);
-    },
-    sendOutput: (sessionId: string, data: string) => {
-      emitter.emit({
-        type: 'terminal:data',
-        source: 'storybook',
-        timestamp: Date.now(),
-        payload: { sessionId, data },
-      });
-    },
-    sendExit: (sessionId: string, exitCode: number) => {
-      emitter.emit({
-        type: 'terminal:exit',
-        source: 'storybook',
-        timestamp: Date.now(),
-        payload: { sessionId, exitCode },
-      });
-    },
-  };
+  setEventEmitter(emitter: PanelEventEmitter) {
+    this.eventEmitter = emitter;
+  }
 
-  return emitter;
-};
+  createSession(options?: CreateTerminalSessionOptions): string {
+    const sessionId = `mock-session-${++this.sessionCounter}`;
+    const cwd = options?.cwd || '/Users/developer/my-project';
+    const shell = 'zsh';
+    const context = options?.context;
 
-/**
- * Create mock context
- */
-const createMockContext = (): PanelContextValue => ({
-  currentScope: {
-    type: 'repository',
-    workspace: { name: 'demo-workspace', path: '/demo' },
-    repository: { name: 'demo-repo', path: '/demo/repo' },
-  },
-  slices: new Map(),
-  getSlice: () => undefined,
-  getWorkspaceSlice: () => undefined,
-  getRepositorySlice: () => undefined,
-  hasSlice: () => false,
-  isSliceLoading: () => false,
-  refresh: async () => {},
-});
+    this.sessions.set(sessionId, { cwd, shell, context });
 
-// Sample terminal outputs
-const WELCOME_OUTPUT = `\x1b[1;32m╔════════════════════════════════════════════════════════════╗\x1b[0m
-\x1b[1;32m║\x1b[0m  \x1b[1;36m🌟 Welcome to Ghostty Terminal\x1b[0m                            \x1b[1;32m║\x1b[0m
-\x1b[1;32m║\x1b[0m  \x1b[90mPowered by ghostty-web WebAssembly\x1b[0m                        \x1b[1;32m║\x1b[0m
-\x1b[1;32m╚════════════════════════════════════════════════════════════╝\x1b[0m
+    // Emit session created event
+    this.emitEvent({
+      type: 'terminal:created',
+      source: 'mock-backend',
+      timestamp: Date.now(),
+      payload: {
+        sessionId,
+        info: {
+          id: sessionId,
+          pid: Math.floor(Math.random() * 10000),
+          cwd,
+          shell,
+          createdAt: Date.now(),
+          lastActivity: Date.now(),
+          context,
+        },
+      },
+    });
 
-\x1b[1;33muser@ghostty\x1b[0m:\x1b[1;34m~/projects\x1b[0m$ `;
+    // Send welcome message after a short delay
+    setTimeout(() => {
+      this.sendData(sessionId, `\x1b[1;32m➜\x1b[0m  \x1b[1;36m${cwd.split('/').pop()}\x1b[0m \x1b[1;34mgit:(\x1b[1;31mmain\x1b[1;34m)\x1b[0m $ `);
+    }, 100);
 
-const GIT_STATUS = `\x1b[1mOn branch \x1b[36mmain\x1b[0m
-\x1b[1mYour branch is up to date with '\x1b[36morigin/main\x1b[0m\x1b[1m'.\x1b[0m
-
-\x1b[1mChanges to be committed:\x1b[0m
-  \x1b[32m(use "git restore --staged <file>..." to unstage)\x1b[0m
-	\x1b[32mmodified:   src/index.tsx\x1b[0m
-	\x1b[32mnew file:   src/panels/TabbedGhosttyTerminal.tsx\x1b[0m
-
-\x1b[1;33muser@ghostty\x1b[0m:\x1b[1;34m~/projects\x1b[0m$ `;
-
-/**
- * Interactive wrapper component for stories
- */
-const InteractiveTabbedTerminalWrapper: React.FC<{
-  initialOutput?: string;
-  showTabControls?: boolean;
-}> = ({ initialOutput, showTabControls = false }) => {
-  const eventsRef = useRef(createInteractiveEvents());
-  const sessionCounterRef = useRef(0);
-  const sessionsRef = useRef<Map<string, { cwd: string }>>(new Map());
-  const [tabState, setTabState] = useState<TerminalTab[]>([]);
-
-  const context = createMockContext();
-
-  // Create mock actions with terminal support
-  const actions: PanelActions & {
-    createTerminalSession: (options?: { cwd?: string }) => Promise<string>;
-    writeToTerminal: (sessionId: string, data: string) => Promise<void>;
-    resizeTerminal: (sessionId: string, cols: number, rows: number) => Promise<void>;
-    destroyTerminalSession: (sessionId: string) => Promise<void>;
-    claimTerminalOwnership: (sessionId: string, force?: boolean) => Promise<{ success: boolean }>;
-    refreshTerminal: (sessionId: string) => Promise<boolean>;
-  } = {
-    openFile: (path) => console.log('[Mock] openFile:', path),
-    openGitDiff: (path) => console.log('[Mock] openGitDiff:', path),
-    navigateToPanel: (id) => console.log('[Mock] navigateToPanel:', id),
-    notifyPanels: (event) => console.log('[Mock] notifyPanels:', event),
-    createTerminalSession: async (options) => {
-      const id = `mock-session-${++sessionCounterRef.current}`;
-      const cwd = options?.cwd || '/demo/repo';
-      sessionsRef.current.set(id, { cwd });
-      console.log('[Mock] Creating terminal session:', id, options);
-
-      // Send welcome message after a delay
+    // Execute initial command if provided
+    if (options?.command) {
       setTimeout(() => {
-        eventsRef.current.sendOutput(id, initialOutput || WELCOME_OUTPUT);
-      }, 300);
+        this.handleCommand(sessionId, options.command!);
+      }, 200);
+    }
 
-      return id;
-    },
-    writeToTerminal: async (sessionId, data) => {
-      console.log('[Mock] writeToTerminal:', sessionId, JSON.stringify(data));
-      // Echo input back
-      eventsRef.current.sendOutput(sessionId, data);
+    return sessionId;
+  }
 
-      // Handle Enter key
-      if (data === '\r') {
-        eventsRef.current.sendOutput(sessionId, '\n');
-        // Simulate command response
-        setTimeout(() => {
-          eventsRef.current.sendOutput(sessionId, `\x1b[1;33muser@ghostty\x1b[0m:\x1b[1;34m~/projects\x1b[0m$ `);
-        }, 100);
+  destroySession(sessionId: string) {
+    this.sessions.delete(sessionId);
+    this.dataSubscribers.delete(sessionId);
+    this.emitEvent({
+      type: 'terminal:exit',
+      source: 'mock-backend',
+      timestamp: Date.now(),
+      payload: { sessionId, exitCode: 0 },
+    });
+  }
+
+  writeToTerminal(sessionId: string, data: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    // Echo the input character
+    this.sendData(sessionId, data);
+
+    // Check for Enter key (carriage return)
+    if (data === '\r') {
+      this.sendData(sessionId, '\n');
+      this.handleCommand(sessionId, '');
+    }
+  }
+
+  // Subscribe to data for a specific session (used by TabbedGhosttyTerminal)
+  onDataForSession(sessionId: string, callback: (data: string) => void): () => void {
+    if (!this.dataSubscribers.has(sessionId)) {
+      this.dataSubscribers.set(sessionId, new Set());
+    }
+    this.dataSubscribers.get(sessionId)!.add(callback);
+
+    // Return unsubscribe function
+    return () => {
+      this.dataSubscribers.get(sessionId)?.delete(callback);
+    };
+  }
+
+  // List all sessions (for session restoration)
+  listSessions(): TerminalSessionInfo[] {
+    const sessions: TerminalSessionInfo[] = [];
+    this.sessions.forEach((session, id) => {
+      sessions.push({
+        id,
+        pid: Math.floor(Math.random() * 10000),
+        cwd: session.cwd,
+        shell: session.shell,
+        createdAt: Date.now() - 60000,
+        lastActivity: Date.now(),
+        context: session.context,
+      });
+    });
+    return sessions;
+  }
+
+  private handleCommand(sessionId: string, command: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    const cmd = command.trim();
+
+    setTimeout(() => {
+      if (cmd === 'ls') {
+        this.sendData(
+          sessionId,
+          '\x1b[1;34msrc\x1b[0m      \x1b[1;34mdist\x1b[0m     package.json  README.md     tsconfig.json\n'
+        );
+      } else if (cmd === 'pwd') {
+        this.sendData(sessionId, `${session.cwd}\n`);
+      } else if (cmd.startsWith('echo ')) {
+        const message = cmd.substring(5);
+        this.sendData(sessionId, `${message}\n`);
+      } else if (cmd === 'git status') {
+        this.sendData(sessionId, '\x1b[1;32mOn branch main\x1b[0m\n');
+        this.sendData(sessionId, "Your branch is up to date with 'origin/main'.\n\n");
+      } else if (cmd === 'clear') {
+        this.sendData(sessionId, '\x1b[2J\x1b[H');
+      } else if (cmd === 'help') {
+        this.sendData(sessionId, 'Available mock commands: ls, pwd, echo, git status, clear, help\n');
+      } else if (cmd) {
+        this.sendData(sessionId, `\x1b[31mzsh: command not found: ${cmd}\x1b[0m\n`);
       }
-    },
-    resizeTerminal: async (sessionId, cols, rows) => {
-      console.log('[Mock] resizeTerminal:', sessionId, cols, 'x', rows);
-    },
-    destroyTerminalSession: async (sessionId) => {
-      console.log('[Mock] destroyTerminalSession:', sessionId);
-      sessionsRef.current.delete(sessionId);
-    },
-    claimTerminalOwnership: async (sessionId) => {
-      console.log('[Mock] claimTerminalOwnership:', sessionId);
-      return { success: true };
-    },
-    refreshTerminal: async (sessionId) => {
-      console.log('[Mock] refreshTerminal:', sessionId);
-      return true;
-    },
-  };
 
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {showTabControls && (
-        <div
-          style={{
-            padding: '10px',
-            backgroundColor: '#2a2a2a',
-            borderBottom: '1px solid #3c3c3c',
-            fontSize: '12px',
-            color: '#888',
-          }}
-        >
-          <div style={{ marginBottom: '8px' }}>
-            <strong style={{ color: '#d4d4d4' }}>Keyboard Shortcuts:</strong>
-          </div>
-          <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap' }}>
-            <span><kbd style={kbdStyle}>⌘T</kbd> New Tab</span>
-            <span><kbd style={kbdStyle}>⌘W</kbd> Close Tab</span>
-            <span><kbd style={kbdStyle}>⌘1-9</kbd> Switch Tabs</span>
-          </div>
-          {tabState.length > 0 && (
-            <div style={{ marginTop: '10px', color: '#666' }}>
-              Active tabs: {tabState.length} | Active: {tabState.find(t => t.isActive)?.label || 'none'}
-            </div>
-          )}
-        </div>
-      )}
-      <div style={{ flex: 1 }}>
-        <TabbedGhosttyTerminal
-          context={context}
-          actions={actions}
-          events={eventsRef.current}
-          onTabsChange={setTabState}
-        />
-      </div>
-    </div>
-  );
-};
+      // Show prompt again
+      this.sendData(
+        sessionId,
+        `\x1b[1;32m➜\x1b[0m  \x1b[1;36m${session.cwd.split('/').pop()}\x1b[0m \x1b[1;34mgit:(\x1b[1;31mmain\x1b[1;34m)\x1b[0m $ `
+      );
+    }, 50);
+  }
 
-const kbdStyle: React.CSSProperties = {
-  backgroundColor: '#3c3c3c',
-  padding: '2px 6px',
-  borderRadius: '3px',
-  border: '1px solid #555',
-  fontFamily: 'monospace',
-  fontSize: '11px',
-};
+  private sendData(sessionId: string, data: string) {
+    // Send to direct subscribers (TabbedGhosttyTerminal uses this)
+    const subscribers = this.dataSubscribers.get(sessionId);
+    if (subscribers) {
+      subscribers.forEach(callback => callback(data));
+    }
+
+    // Also emit event (for compatibility)
+    this.emitEvent({
+      type: 'terminal:data',
+      source: 'mock-backend',
+      timestamp: Date.now(),
+      payload: { sessionId, data },
+    });
+  }
+
+  private emitEvent(event: PanelEvent) {
+    if (this.eventEmitter) {
+      this.eventEmitter.emit(event);
+    }
+  }
+}
+
+// Global backend instance for stories
+const mockBackend = new MockTabbedTerminalBackend();
+
+/**
+ * Create mock actions with tabbed terminal backend
+ */
+const createTabbedTerminalMockActions = (): TerminalActions => ({
+  createTerminalSession: async (options?: CreateTerminalSessionOptions) => {
+    console.log('[Mock] Creating terminal session:', options);
+    return mockBackend.createSession(options);
+  },
+  destroyTerminalSession: async (sessionId: string) => {
+    console.log('[Mock] Destroying terminal session:', sessionId);
+    mockBackend.destroySession(sessionId);
+  },
+  writeToTerminal: async (sessionId: string, data: string) => {
+    mockBackend.writeToTerminal(sessionId, data);
+  },
+  resizeTerminal: async (sessionId: string, cols: number, rows: number) => {
+    console.log('[Mock] Resizing terminal:', sessionId, cols, rows);
+  },
+  // Key action for TabbedGhosttyTerminal - subscribe to session data
+  onTerminalData: (sessionId: string, callback: (data: string) => void) => {
+    console.log('[Mock] Subscribing to terminal data for session:', sessionId);
+    return mockBackend.onDataForSession(sessionId, callback);
+  },
+  // List sessions for restoration
+  listTerminalSessions: async () => {
+    console.log('[Mock] Listing terminal sessions');
+    return mockBackend.listSessions();
+  },
+  // Ownership actions (mock)
+  claimTerminalOwnership: async (sessionId: string) => {
+    console.log('[Mock] Claiming terminal ownership:', sessionId);
+    return { success: true };
+  },
+  refreshTerminal: async (sessionId: string) => {
+    console.log('[Mock] Refreshing terminal:', sessionId);
+    return true;
+  },
+});
 
 const meta: Meta<typeof TabbedGhosttyTerminal> = {
   title: 'Panels/TabbedGhosttyTerminal',
   component: TabbedGhosttyTerminal,
   parameters: {
     layout: 'fullscreen',
+    docs: {
+      description: {
+        component:
+          'A tabbed terminal panel using the Ghostty WebAssembly engine.\n\n' +
+          '**Key Features:**\n' +
+          '- Multiple terminal tabs with create/close functionality\n' +
+          '- Session restoration from existing terminals filtered by context\n' +
+          '- Keyboard shortcuts (Cmd+T, Cmd+W, Cmd+1-9)\n\n' +
+          '**Required Props:**\n' +
+          '- `terminalContext`: Identifier for filtering/grouping sessions\n' +
+          '- `directory`: Default directory for new terminal sessions\n\n' +
+          '**Required Actions from Host:**\n' +
+          '- `onTerminalData(sessionId, callback)`: Subscribe to session data\n' +
+          '- `listTerminalSessions()`: List existing sessions for restoration',
+      },
+    },
   },
-  decorators: [
-    (Story) => (
-      <div style={{ width: '100vw', height: '100vh', backgroundColor: '#1e1e1e' }}>
-        <Story />
-      </div>
-    ),
-  ],
+  tags: ['autodocs'],
 };
 
 export default meta;
 type Story = StoryObj<typeof TabbedGhosttyTerminal>;
 
 /**
- * Default tabbed terminal with one tab
+ * Story wrapper that sets up mock context, actions, and events
+ */
+const StoryWrapper: React.FC<{
+  children: (props: { context: ReturnType<typeof createMockContext>; actions: TerminalActions; events: PanelEventEmitter }) => React.ReactNode;
+  actionsOverrides?: Partial<TerminalActions>;
+}> = ({ children, actionsOverrides }) => {
+  const context = createMockContext({
+    currentScope: {
+      type: 'repository' as const,
+      repository: {
+        name: 'my-project',
+        path: '/Users/developer/my-project',
+      },
+    },
+  });
+  const events = createMockEvents();
+  const actions = { ...createTabbedTerminalMockActions(), ...actionsOverrides };
+
+  mockBackend.setEventEmitter(events);
+
+  return <>{children({ context, actions, events })}</>;
+};
+
+/**
+ * Default tabbed terminal panel
+ *
+ * Features:
+ * - Click the + button or press Cmd+T to add new tabs
+ * - Hover over a tab and click X to close it (or press Cmd+W)
+ * - Press Cmd+1-9 to switch between tabs
+ * - Try typing commands like: ls, pwd, echo hello, git status, help
  */
 export const Default: Story = {
-  render: () => <InteractiveTabbedTerminalWrapper />,
-};
-
-/**
- * Tabbed terminal with keyboard shortcut hints
- */
-export const WithKeyboardHints: Story = {
-  render: () => <InteractiveTabbedTerminalWrapper showTabControls />,
-};
-
-/**
- * Terminal showing git status output
- */
-export const WithGitStatus: Story = {
   render: () => (
-    <InteractiveTabbedTerminalWrapper initialOutput={GIT_STATUS} showTabControls />
+    <ThemeProvider>
+      <div style={{ height: '600px', width: '100%' }}>
+        <StoryWrapper>
+          {({ context, actions, events }) => (
+            <TabbedGhosttyTerminal
+              context={context}
+              actions={actions}
+              events={events}
+              terminalContext="terminal:my-project"
+              directory="/Users/developer/my-project"
+            />
+          )}
+        </StoryWrapper>
+      </div>
+    </ThemeProvider>
   ),
 };
 
 /**
- * Multiple tabs demo - start with one, use ⌘T to add more
- */
-export const MultipleTabsDemo: Story = {
-  render: () => {
-    return (
-      <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-        <div
-          style={{
-            padding: '16px',
-            backgroundColor: '#1f2937',
-            borderBottom: '1px solid #374151',
-            color: '#e5e7eb',
-          }}
-        >
-          <h3 style={{ margin: '0 0 8px 0', fontSize: '14px', fontWeight: 'bold' }}>
-            🎯 Multi-Tab Terminal Demo
-          </h3>
-          <p style={{ margin: '0 0 12px 0', fontSize: '12px', color: '#9ca3af' }}>
-            Try the keyboard shortcuts to manage tabs:
-          </p>
-          <div style={{ display: 'flex', gap: '24px', fontSize: '12px' }}>
-            <div>
-              <kbd style={kbdStyle}>⌘T</kbd>
-              <span style={{ marginLeft: '8px' }}>Create new tab</span>
-            </div>
-            <div>
-              <kbd style={kbdStyle}>⌘W</kbd>
-              <span style={{ marginLeft: '8px' }}>Close current tab</span>
-            </div>
-            <div>
-              <kbd style={kbdStyle}>⌘1</kbd> - <kbd style={kbdStyle}>⌘9</kbd>
-              <span style={{ marginLeft: '8px' }}>Switch to tab 1-9</span>
-            </div>
-          </div>
-        </div>
-        <div style={{ flex: 1 }}>
-          <InteractiveTabbedTerminalWrapper />
-        </div>
-      </div>
-    );
-  },
-};
-
-/**
- * Compact size container
- */
-export const CompactSize: Story = {
-  render: () => <InteractiveTabbedTerminalWrapper showTabControls />,
-  decorators: [
-    (Story) => (
-      <div
-        style={{
-          width: '700px',
-          height: '500px',
-          backgroundColor: '#1e1e1e',
-          margin: '20px',
-          border: '1px solid #333',
-          borderRadius: '8px',
-          overflow: 'hidden',
-        }}
-      >
-        <Story />
-      </div>
-    ),
-  ],
-};
-
-/**
- * With initial tabs pre-configured
+ * With initial tabs
+ *
+ * Demonstrates pre-configured tabs on load.
  */
 export const WithInitialTabs: Story = {
-  render: () => {
-    const eventsRef = useRef(createInteractiveEvents());
-    const sessionCounterRef = useRef(0);
-    const context = createMockContext();
-
-    const initialTabs: TerminalTab[] = [
-      { id: 'tab-1', label: 'frontend', directory: '/demo/frontend', isActive: true },
-      { id: 'tab-2', label: 'backend', directory: '/demo/backend', isActive: false },
-      { id: 'tab-3', label: 'scripts', directory: '/demo/scripts', isActive: false },
-    ];
-
-    const actions: PanelActions & {
-      createTerminalSession: (options?: { cwd?: string }) => Promise<string>;
-      writeToTerminal: (sessionId: string, data: string) => Promise<void>;
-      resizeTerminal: (sessionId: string, cols: number, rows: number) => Promise<void>;
-      destroyTerminalSession: (sessionId: string) => Promise<void>;
-      claimTerminalOwnership: (sessionId: string, force?: boolean) => Promise<{ success: boolean }>;
-      refreshTerminal: (sessionId: string) => Promise<boolean>;
-    } = {
-      openFile: () => {},
-      openGitDiff: () => {},
-      navigateToPanel: () => {},
-      notifyPanels: () => {},
-      createTerminalSession: async (options) => {
-        const id = `mock-session-${++sessionCounterRef.current}`;
-        const dir = options?.cwd?.split('/').pop() || 'terminal';
-        setTimeout(() => {
-          eventsRef.current.sendOutput(
-            id,
-            `\x1b[1;33muser@ghostty\x1b[0m:\x1b[1;34m~/${dir}\x1b[0m$ `
-          );
-        }, 300);
-        return id;
-      },
-      writeToTerminal: async (sessionId, data) => {
-        eventsRef.current.sendOutput(sessionId, data);
-        if (data === '\r') {
-          eventsRef.current.sendOutput(sessionId, '\n');
-          setTimeout(() => {
-            eventsRef.current.sendOutput(sessionId, `\x1b[1;33muser@ghostty\x1b[0m:\x1b[1;34m~/projects\x1b[0m$ `);
-          }, 100);
-        }
-      },
-      resizeTerminal: async () => {},
-      destroyTerminalSession: async () => {},
-      claimTerminalOwnership: async () => ({ success: true }),
-      refreshTerminal: async () => true,
-    };
-
-    return (
-      <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-        <div
-          style={{
-            padding: '12px',
-            backgroundColor: '#2a2a2a',
-            borderBottom: '1px solid #3c3c3c',
-            fontSize: '12px',
-            color: '#888',
-          }}
-        >
-          <strong style={{ color: '#d4d4d4' }}>Pre-configured with 3 tabs:</strong>
-          <span style={{ marginLeft: '12px' }}>frontend, backend, scripts</span>
-        </div>
-        <div style={{ flex: 1 }}>
-          <TabbedGhosttyTerminal
-            context={context}
-            actions={actions}
-            events={eventsRef.current}
-            initialTabs={initialTabs}
-          />
-        </div>
+  render: () => (
+    <ThemeProvider>
+      <div style={{ height: '600px', width: '100%' }}>
+        <StoryWrapper>
+          {({ context, actions, events }) => (
+            <TabbedGhosttyTerminal
+              context={context}
+              actions={actions}
+              events={events}
+              terminalContext="terminal:my-project"
+              directory="/Users/developer/my-project"
+              initialTabs={[
+                {
+                  id: 'tab-1',
+                  label: 'my-project',
+                  directory: '/Users/developer/my-project',
+                  isActive: true,
+                },
+                {
+                  id: 'tab-2',
+                  label: 'docs',
+                  directory: '/Users/developer/my-project/docs',
+                  isActive: false,
+                },
+              ]}
+            />
+          )}
+        </StoryWrapper>
       </div>
-    );
-  },
+    </ThemeProvider>
+  ),
+};
+
+/**
+ * Hidden header (tabs only)
+ *
+ * Shows how the panel looks with the header hidden.
+ */
+export const HiddenHeader: Story = {
+  render: () => (
+    <ThemeProvider>
+      <div style={{ height: '600px', width: '100%' }}>
+        <StoryWrapper>
+          {({ context, actions, events }) => (
+            <TabbedGhosttyTerminal
+              context={context}
+              actions={actions}
+              events={events}
+              terminalContext="terminal:my-project"
+              directory="/Users/developer/my-project"
+              hideHeader={true}
+              initialTabs={[
+                {
+                  id: 'tab-1',
+                  label: 'my-project',
+                  directory: '/Users/developer/my-project',
+                  isActive: true,
+                },
+              ]}
+            />
+          )}
+        </StoryWrapper>
+      </div>
+    </ThemeProvider>
+  ),
+};
+
+/**
+ * Empty state
+ *
+ * Shows the empty state when no tabs exist.
+ */
+export const EmptyState: Story = {
+  render: () => (
+    <ThemeProvider>
+      <div style={{ height: '600px', width: '100%' }}>
+        <StoryWrapper actionsOverrides={{ listTerminalSessions: async () => [] }}>
+          {({ context, actions, events }) => (
+            <TabbedGhosttyTerminal
+              context={context}
+              actions={actions}
+              events={events}
+              terminalContext="terminal:my-project"
+              directory="/Users/developer/my-project"
+              initialTabs={[]}
+            />
+          )}
+        </StoryWrapper>
+      </div>
+    </ThemeProvider>
+  ),
+};
+
+/**
+ * Error: No onTerminalData action
+ *
+ * Demonstrates error when host doesn't provide the required onTerminalData action.
+ */
+export const ErrorNoDataAction: Story = {
+  render: () => (
+    <ThemeProvider>
+      <div style={{ height: '600px', width: '100%' }}>
+        <StoryWrapper actionsOverrides={{ onTerminalData: undefined }}>
+          {({ context, actions, events }) => (
+            <TabbedGhosttyTerminal
+              context={context}
+              actions={actions}
+              events={events}
+              terminalContext="terminal:my-project"
+              directory="/Users/developer/my-project"
+              initialTabs={[
+                {
+                  id: 'tab-1',
+                  label: 'my-project',
+                  directory: '/Users/developer/my-project',
+                  isActive: true,
+                },
+              ]}
+            />
+          )}
+        </StoryWrapper>
+      </div>
+    </ThemeProvider>
+  ),
 };
