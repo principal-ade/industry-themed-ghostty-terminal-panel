@@ -196,10 +196,24 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
         }
       });
 
+      // For restored sessions, request a refresh to get the buffer contents
+      // Do this after subscription is set up so we receive the data
+      let refreshTimeout: NodeJS.Timeout | undefined;
+      if (sessionId && actions.refreshTerminal) {
+        refreshTimeout = setTimeout(() => {
+          actions.refreshTerminal!(localSessionId).catch((err) => {
+            console.warn('[TerminalTabContent] Failed to refresh restored session:', err);
+          });
+        }, 100);
+      }
+
       return () => {
         unsubscribe();
+        if (refreshTimeout) {
+          clearTimeout(refreshTimeout);
+        }
       };
-    }, [localSessionId, isInitialized, actions]);
+    }, [localSessionId, isInitialized, actions, sessionId]);
 
     // Focus terminal and refresh when tab becomes active
     useEffect(() => {
