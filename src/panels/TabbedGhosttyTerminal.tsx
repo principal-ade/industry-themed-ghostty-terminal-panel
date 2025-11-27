@@ -335,10 +335,11 @@ export const TabbedGhosttyTerminal: React.FC<TabbedGhosttyTerminalProps> = ({
 
         ourSessions.forEach((session, index) => {
           const tabId = `tab-restored-${session.id}`;
+          const sessionCwd = session.cwd || directory;
           const tab: TerminalTab = {
             id: tabId,
-            label: session.cwd.split('/').pop() || session.cwd,
-            directory: session.cwd,
+            label: sessionCwd.split('/').pop() || sessionCwd,
+            directory: sessionCwd,
             isActive: index === 0,
           };
 
