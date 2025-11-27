@@ -196,21 +196,24 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
         }
       });
 
-      // For restored sessions, request a refresh to get the buffer contents
-      // Do this after subscription is set up so we receive the data
-      let refreshTimeout: NodeJS.Timeout | undefined;
-      if (sessionId && actions.refreshTerminal) {
-        refreshTimeout = setTimeout(() => {
-          actions.refreshTerminal!(localSessionId).catch((err) => {
-            console.warn('[TerminalTabContent] Failed to refresh restored session:', err);
-          });
+      // For restored sessions, trigger a resize to get the buffer contents redrawn
+      // Resize triggers SIGWINCH which causes the PTY to redraw its entire buffer
+      // This is more effective than Ctrl+L which only clears and shows the prompt
+      let resizeTimeout: NodeJS.Timeout | undefined;
+      if (sessionId && actions.resizeTerminal) {
+        resizeTimeout = setTimeout(() => {
+          const terminal = terminalInstanceRef.current;
+          if (terminal && actions.resizeTerminal) {
+            // Trigger resize with current dimensions to force buffer redraw
+            actions.resizeTerminal(localSessionId, terminal.cols, terminal.rows);
+          }
         }, 100);
       }
 
       return () => {
         unsubscribe();
-        if (refreshTimeout) {
-          clearTimeout(refreshTimeout);
+        if (resizeTimeout) {
+          clearTimeout(resizeTimeout);
         }
       };
     }, [localSessionId, isInitialized, actions, sessionId]);
