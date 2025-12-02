@@ -1,6 +1,6 @@
 {
   "name": "@industry-theme/ghostty-terminal-panel",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "High-performance terminal panel using Ghostty WebAssembly rendering engine",
   "type": "module",
   "main": "dist/panels.bundle.js",
