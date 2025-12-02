@@ -96,6 +96,14 @@ export interface RequestDataPortResult {
 }
 
 /**
+ * Data provided when ownership of a terminal session is lost
+ */
+export interface OwnershipLostData {
+  sessionId: string;
+  newOwnerWindowId: number;
+}
+
+/**
  * Data provided when a MessagePort is ready
  */
 export interface PortReadyData {
@@ -151,6 +159,13 @@ export interface TerminalActions extends CorePanelActions {
   checkTerminalOwnership?: (sessionId: string) => Promise<OwnershipStatus>;
   claimTerminalOwnership?: (sessionId: string, force?: boolean) => Promise<OwnershipResult>;
   releaseTerminalOwnership?: (sessionId: string) => Promise<OwnershipResult>;
+
+  /**
+   * Subscribe to ownership lost events.
+   * Called when another window takes ownership of a terminal this window was using.
+   * Returns an unsubscribe function.
+   */
+  onOwnershipLost?: (callback: (data: OwnershipLostData) => void) => () => void;
 
   // Terminal control
   refreshTerminal?: (sessionId: string) => Promise<boolean>;

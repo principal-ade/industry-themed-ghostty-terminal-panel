@@ -45,6 +45,42 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
     const [isInitialized, setIsInitialized] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
+    // Ownership state - use shouldRenderTerminal like TabbedTerminalPanel
+    const [shouldRenderTerminal, setShouldRenderTerminal] = useState(true);
+    const [ownerWindowId, setOwnerWindowId] = useState<number | null>(null);
+
+    // Claim ownership and set up session state
+    // Used by both initial mount and take control
+    const claimAndConnect = useCallback(async (targetSessionId: string) => {
+      try {
+        // Claim ownership
+        if (actions.claimTerminalOwnership) {
+          await actions.claimTerminalOwnership(targetSessionId);
+        }
+
+        // Clear ownership lost state (in case we're taking control back)
+        setShouldRenderTerminal(true);
+        setOwnerWindowId(null);
+
+        // Trigger resize to redraw buffer
+        setTimeout(() => {
+          if (fitAddonRef.current && terminalInstanceRef.current) {
+            fitAddonRef.current.fit();
+            if (actions.resizeTerminal && targetSessionId) {
+              actions.resizeTerminal(
+                targetSessionId,
+                terminalInstanceRef.current.cols,
+                terminalInstanceRef.current.rows
+              );
+            }
+          }
+        }, 100);
+      } catch (error) {
+        console.error('[TerminalTabContent] Failed to claim ownership:', error);
+        throw error;
+      }
+    }, [actions]);
+
     // Initialize terminal session
     useEffect(() => {
       if (hasInitializedRef.current) return;
@@ -56,13 +92,9 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
         try {
           // If we already have a session ID (restored), use it
           if (sessionId) {
+            await claimAndConnect(sessionId);
             setLocalSessionId(sessionId);
             setIsInitialized(true);
-
-            // Claim ownership if available
-            if (actions.claimTerminalOwnership) {
-              await actions.claimTerminalOwnership(sessionId);
-            }
             return;
           }
 
@@ -84,10 +116,8 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
           setIsInitialized(true);
           onSessionCreated(tab.id, newSessionId);
 
-          // Claim ownership if available
-          if (actions.claimTerminalOwnership) {
-            await actions.claimTerminalOwnership(newSessionId);
-          }
+          // Claim ownership
+          await claimAndConnect(newSessionId);
         } catch (err) {
           console.error('[TerminalTabContent] Failed to create session:', err);
           setError(err instanceof Error ? err.message : String(err));
@@ -183,8 +213,9 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
     }, [localSessionId, isActive, actions, theme]);
 
     // Subscribe to terminal data using onTerminalData
+    // Only subscribe when we own the terminal (shouldRenderTerminal is true)
     useEffect(() => {
-      if (!localSessionId || !isInitialized) return;
+      if (!localSessionId || !isInitialized || !shouldRenderTerminal) return;
       if (!actions.onTerminalData) {
         console.error('[TerminalTabContent] onTerminalData not available');
         return;
@@ -200,14 +231,24 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
       // Resize triggers SIGWINCH which causes the PTY to redraw its entire buffer
       // This is more effective than Ctrl+L which only clears and shows the prompt
       let resizeTimeout: NodeJS.Timeout | undefined;
-      if (sessionId && actions.resizeTerminal) {
+      let resizeBackTimeout: NodeJS.Timeout | undefined;
+      if (sessionId && terminalInstanceRef.current) {
         resizeTimeout = setTimeout(() => {
           const terminal = terminalInstanceRef.current;
           if (terminal && actions.resizeTerminal) {
-            // Trigger resize with current dimensions to force buffer redraw
-            actions.resizeTerminal(localSessionId, terminal.cols, terminal.rows);
+            const currentCols = terminal.cols;
+            const currentRows = terminal.rows;
+            // Resize to different dimensions to trigger redraw
+            if (fitAddonRef.current) {
+              // Temporarily resize
+              actions.resizeTerminal(localSessionId, currentCols - 1, currentRows);
+              // Resize back to original dimensions
+              resizeBackTimeout = setTimeout(() => {
+                actions.resizeTerminal!(localSessionId, currentCols, currentRows);
+              }, 50);
+            }
           }
-        }, 100);
+        }, 200);
       }
 
       return () => {
@@ -215,8 +256,11 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
         if (resizeTimeout) {
           clearTimeout(resizeTimeout);
         }
+        if (resizeBackTimeout) {
+          clearTimeout(resizeBackTimeout);
+        }
       };
-    }, [localSessionId, isInitialized, actions, sessionId]);
+    }, [localSessionId, isInitialized, actions, sessionId, shouldRenderTerminal]);
 
     // Focus terminal and refresh when tab becomes active
     useEffect(() => {
@@ -238,6 +282,34 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
         }
       }
     }, [isActive, localSessionId, actions]);
+
+    // Listen for ownership lost events
+    useEffect(() => {
+      if (!localSessionId || !actions.onOwnershipLost) return;
+
+      const unsubscribe = actions.onOwnershipLost((data) => {
+        if (data.sessionId === localSessionId) {
+          console.log(
+            `[TerminalTabContent] Ownership lost for session ${localSessionId}, new owner: ${data.newOwnerWindowId}`
+          );
+          console.log('[TerminalTabContent] Setting shouldRenderTerminal to false to show overlay');
+          setShouldRenderTerminal(false);
+          setOwnerWindowId(data.newOwnerWindowId);
+        }
+      });
+
+      return () => {
+        unsubscribe();
+      };
+    }, [localSessionId, actions]);
+
+    // Handle take control button - uses same logic as initial connection
+    const handleTakeControl = useCallback(async () => {
+      if (!localSessionId) return;
+
+      console.log('[TerminalTabContent] Taking control');
+      await claimAndConnect(localSessionId);
+    }, [localSessionId, claimAndConnect]);
 
     if (error) {
       return (
@@ -273,6 +345,73 @@ const TerminalTabContent = React.memo<TerminalTabContentProps>(
           }}
         >
           Initializing terminal...
+        </div>
+      );
+    }
+
+    // When ownership is lost, render overlay without interactive terminal
+    if (!shouldRenderTerminal) {
+      return (
+        <div
+          style={{
+            display: isActive ? 'flex' : 'none',
+            flexDirection: 'column',
+            height: '100%',
+            width: '100%',
+            position: 'relative',
+            backgroundColor: theme.colors.background,
+          }}
+        >
+          {/* Terminal container (dimmed/read-only) */}
+          <div
+            ref={terminalRef}
+            style={{
+              width: '100%',
+              height: '100%',
+              opacity: 0.3,
+              pointerEvents: 'none',
+            }}
+          />
+          {/* Overlay */}
+          <div
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              backgroundColor: 'rgba(0, 0, 0, 0.7)',
+              gap: '16px',
+            }}
+          >
+            <div style={{ color: theme.colors.text, fontSize: '16px', fontWeight: 'bold' }}>
+              This terminal is active in another window
+            </div>
+            <div style={{ color: theme.colors.textSecondary, fontSize: '14px' }}>
+              {ownerWindowId
+                ? `Window ID: ${ownerWindowId}`
+                : 'Another window owns this terminal session'}
+            </div>
+            <button
+              onClick={handleTakeControl}
+              style={{
+                padding: '10px 20px',
+                backgroundColor: theme.colors.primary,
+                color: theme.colors.background,
+                border: 'none',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: 'bold',
+              }}
+            >
+              Take Control
+            </button>
+          </div>
         </div>
       );
     }

@@ -1,5 +1,6 @@
 import { GhosttyTerminal } from './panels/GhosttyTerminal';
 import type { PanelDefinition, PanelContextValue } from './types';
+import { ghosttyTerminalPanelTools, ghosttyTerminalPanelToolsMetadata } from './tools';
 
 /**
  * Export array of panel definitions.
@@ -20,6 +21,7 @@ export const panels: PanelDefinition[] = [
       description:
         'High-performance Wasm-based terminal panel using the Ghostty rendering engine',
       slices: ['terminal'], // Data slices this panel depends on
+      tools: ghosttyTerminalPanelTools,
     },
     component: GhosttyTerminal,
 
@@ -82,3 +84,17 @@ export type {
   CreateTerminalSessionOptions,
   GhosttyTerminalProps,
 } from './types';
+
+/**
+ * Export tools for server-safe imports.
+ * Use '@industry-theme/ghostty-terminal-panel/tools' to import without React dependencies.
+ */
+export {
+  ghosttyTerminalPanelTools,
+  ghosttyTerminalPanelToolsMetadata,
+  createTerminalSessionTool,
+  writeToTerminalTool,
+  closeTerminalSessionTool,
+  clearTerminalTool,
+  focusTerminalTool,
+} from './tools';
